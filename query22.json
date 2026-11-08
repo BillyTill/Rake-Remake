@@ -1,0 +1,1 @@
+{"query": "unity.assets('t:WeaponLookConfig') | select $ref name"}

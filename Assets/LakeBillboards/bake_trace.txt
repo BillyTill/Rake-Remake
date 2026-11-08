@@ -1,0 +1,5 @@
+BAKE v8.5 start
+layer=8
+sky killed (comps=14, killed=4)
+SKIP prefab_Beech_mushroom_04C
+done: photos=107 total=108 failed=1

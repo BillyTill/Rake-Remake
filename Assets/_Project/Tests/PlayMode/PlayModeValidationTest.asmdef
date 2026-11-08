@@ -1,0 +1,16 @@
+{
+    "name": "Lake.PlayMode.Tests",
+    "references": [
+        "Assembly-CSharp",
+        "UnityEngine.TestRunner"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [
+        "LAKE_PLAYMODE_TESTS"
+    ]
+}

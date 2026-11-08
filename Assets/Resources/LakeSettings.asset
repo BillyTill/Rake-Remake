@@ -1,0 +1,20 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 218ba261e9552ed48a34565724c4af5a, type: 3}
+  m_Name: LakeSettings
+  m_EditorClassIdentifier: Assembly-CSharp::Lake.Bootstrap.LakeSettings
+  targetFrameRate: 60
+  vSyncCount: 1
+  lockCursorOnStart: 1
+  playerPrefab: {fileID: 4298003217311865454, guid: e2dd780fcbd60284da80dc7873227429, type: 3}
+  spawnPosition: {x: 0, y: 0.1, z: -4}
+  spawnEulerAngles: {x: 0, y: 0, z: 0}

@@ -1,0 +1,1 @@
+{"query": "objects | where name == 'Player' | recurse children max-depth=4 | select name active $ref components.$type transform.position transform.localPosition"}

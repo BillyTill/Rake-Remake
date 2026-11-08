@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: 3c4f9b5a6d7e8f9a0b1c2d3e4f5a6b7c
+SpringCameraConfig:
+  m_ObjectHideFlags: 0
+  m_Script: {fileID: 11500000, guid: ee2748ff3e2b61e4f864161736f098cb, type: 3}
+  stiffness: 120
+  damping: 20
+  maxAngularVelocity: 1080
+  positionOffset: {x: 0, y: 0, z: 0}
+  rotationOffset: {x: 0, y: 0, z: 0}
+  maxPositionOffset: 0.1
+  maxRotationOffset: 10
+  positionSway: 0.0005
+  maxPositionalSway: 0.014
+  swayReturn: 17
+  rotationalSwayPerDegree: 0.035
+  maxRotationalSway: 1.0
+  rotationalSwayReturn: 15

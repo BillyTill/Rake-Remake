@@ -1,0 +1,26 @@
+{
+  "name": "extensions.unity.playerprefsex",
+  "displayName": "PlayerPrefsEx",
+  "author": {
+    "name": "Ivan Murzak",
+    "url": "https://github.com/IvanMurzak"
+  },
+  "version": "2.1.5",
+  "unity": "2018.3",
+  "description": "Lightweight package with optimized advanced version of PlayerPrefs. Under the hood it uses the same PlayerPrefs system, but creates flexible wrapper for default system.",
+  "keywords": [
+    "playerprefs",
+    "reactive variables",
+    "reactive playerprefs",
+    "unity",
+    "data",
+    "data saving",
+    "reactive data"
+  ],
+  "dependencies": {},
+  "repository": {
+    "url": "https://github.com/IvanMurzak/Unity-PlayerPrefsEx",
+    "type": "git",
+    "revision": "20d272c68e62b93112a9edff836c9a1eb7a386ec"
+  }
+}

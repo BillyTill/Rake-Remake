@@ -1,0 +1,1 @@
+{"query": "objects | where name == 'BodycamTest_Player' | call Destroy()"}

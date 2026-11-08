@@ -1,0 +1,1 @@
+{"query": "objects | where name == 'Flashlight' | get components | where $type == 'Flashlight' | set weaponPivot = ref('WeaponPivotController#-39436')"}

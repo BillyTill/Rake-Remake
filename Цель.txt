@@ -1,0 +1,1837 @@
+# Полная система Bodycam Horror Prototype v2
+
+Переработанная архитектура с учётом **правильной free-aim механики Bodycam** + закрытие всех багов из аудита + боевая система уровня игры.
+
+---
+
+## 🏛 Итоговая архитектура
+
+```
+Player (CharacterController, PlayerMotor, BodyFollower)
+├── AimPivot (AimPivot)              ← МЫШЬ ВРАЩАЕТ ЭТО напрямую
+│   ├── WeaponHolder (WeaponController, ADSController)
+│   │   ├── Rifle (WeaponRuntime) ──── MuzzlePoint
+│   │   └── Shotgun (WeaponRuntime) ─── MuzzlePoint
+│   └── Flashlight (Light, Flashlight)
+│
+└── Camera (CameraFollower)          ← СЛЕДУЕТ за AimPivot с deadzone
+    └── RecoilController
+
+RecoilController корректирует AimPivot.pitch при выстреле.
+CameraEffects (bob) пишут в CameraContainer (не в AimPivot).
+```
+
+**Ключевое правило**: `raycast.origin = muzzlePoint.position`, `raycast.direction = aimPivot.forward`. Не камера!
+
+---
+
+## 📁 Дерево файлов
+
+```
+Assets/_Project/Scripts/
+├── Core/
+│   ├── InputProvider.cs
+│   ├── DamageInfo.cs
+│   ├── IDamageable.cs
+│   └── IInteractable.cs
+├── Aim/
+│   ├── AimPivot.cs
+│   ├── CameraFollower.cs
+│   └── RecoilController.cs
+├── Player/
+│   ├── PlayerMotor.cs
+│   ├── BodyFollower.cs
+│   ├── CameraEffects.cs
+│   ├── PlayerHealth.cs
+│   ├── PlayerSpawner.cs
+│   └── PlayerInteractor.cs
+├── Weapons/
+│   ├── WeaponType.cs
+│   ├── WeaponDataSO.cs
+│   ├── WeaponRuntime.cs
+│   ├── WeaponController.cs
+│   ├── WeaponSway.cs
+│   ├── ADSController.cs
+│   ├── HitZone.cs
+│   ├── WeaponPickup.cs
+│   └── VFX/
+│       ├── MuzzleFlash.cs
+│       ├── MuzzleFlashLight.cs
+│       └── TracerLine.cs
+├── Flashlight/
+│   ├── BatteryStrategies.cs
+│   └── Flashlight.cs
+├── BodyCam/
+│   ├── BodyCamConfigSO.cs
+│   └── BodyCamController.cs
+├── Health/
+│   └── HealthComponent.cs
+└── Scene/
+    ├── HorrorSceneBuilder.cs
+    ├── SpawnPoint.cs
+    └── TestTarget.cs
+```
+
+---
+
+## 💻 Код
+
+### Core/InputProvider.cs
+
+```csharp
+using System;
+using UnityEngine;
+
+namespace Lake.Core
+{
+    /// <summary>
+    /// Singleton. Все потребители подписываются на события в OnEnable.
+    /// Никто не читает Input.* напрямую — гарантирует консистентность.
+    /// </summary>
+    public class InputProvider : MonoBehaviour
+    {
+        public static InputProvider Instance { get; private set; }
+
+        [Header("Keys")]
+        public KeyCode interactKey = KeyCode.E;
+        public KeyCode reloadKey = KeyCode.R;
+        public KeyCode dropKey = KeyCode.G;
+        public KeyCode flashlightKey = KeyCode.F;
+        public KeyCode bodycamToggleKey = KeyCode.B;
+        public KeyCode rifleSlotKey = KeyCode.Alpha1;
+        public KeyCode shotgunSlotKey = KeyCode.Alpha2;
+
+        // Continuous
+        public Vector2 MoveInput { get; private set; }
+        public Vector2 LookInput { get; private set; }
+        public bool Sprint { get; private set; }
+        public bool Crouch { get; private set; }
+        public bool ADS { get; private set; }
+        public bool FireHeld { get; private set; }
+
+        // Events
+        public event Action InteractPressed;
+        public event Action ReloadPressed;
+        public event Action DropPressed;
+        public event Action FlashlightPressed;
+        public event Action BodyCamTogglePressed;
+        public event Action EscapePressed;
+        public event Action<int> WeaponSlotPressed;
+        public event Action FireStarted;
+        public event Action FireStopped;
+        public event Action ADSStarted;
+        public event Action ADSEnded;
+
+        bool _firePrev, _adsPrev;
+
+        void Awake()
+        {
+            if (Instance != null && Instance != this) { Destroy(gameObject); return; }
+            Instance = this;
+            LockCursor();
+        }
+
+        void OnDestroy() { if (Instance == this) Instance = null; }
+
+        void Update()
+        {
+            MoveInput = new Vector2(Input.GetAxisRaw("Horizontal"), Input.GetAxisRaw("Vertical"));
+            LookInput = new Vector2(Input.GetAxis("Mouse X"), Input.GetAxis("Mouse Y"));
+            Sprint = Input.GetKey(KeyCode.LeftShift);
+            Crouch = Input.GetKey(KeyCode.LeftControl);
+
+            if (Input.GetKeyDown(interactKey))      InteractPressed?.Invoke();
+            if (Input.GetKeyDown(reloadKey))        ReloadPressed?.Invoke();
+            if (Input.GetKeyDown(dropKey))          DropPressed?.Invoke();
+            if (Input.GetKeyDown(flashlightKey))    FlashlightPressed?.Invoke();
+            if (Input.GetKeyDown(bodycamToggleKey)) BodyCamTogglePressed?.Invoke();
+            if (Input.GetKeyDown(rifleSlotKey))     WeaponSlotPressed?.Invoke(0);
+            if (Input.GetKeyDown(shotgunSlotKey))   WeaponSlotPressed?.Invoke(1);
+
+            FireHeld = Input.GetMouseButton(0);
+            if (FireHeld && !_firePrev) FireStarted?.Invoke();
+            if (!FireHeld && _firePrev) FireStopped?.Invoke();
+            _firePrev = FireHeld;
+
+            ADS = Input.GetMouseButton(1);
+            if (ADS && !_adsPrev) ADSStarted?.Invoke();
+            if (!ADS && _adsPrev) ADSEnded?.Invoke();
+            _adsPrev = ADS;
+
+            // Escape → unlock, LMB → lock
+            if (Input.GetKeyDown(KeyCode.Escape))
+            {
+                Cursor.lockState = CursorLockMode.None;
+                Cursor.visible = true;
+                EscapePressed?.Invoke();
+            }
+            else if (Input.GetMouseButtonDown(0) && Cursor.lockState != CursorLockMode.Locked)
+            {
+                LockCursor();
+            }
+        }
+
+        void LockCursor()
+        {
+            Cursor.lockState = CursorLockMode.Locked;
+            Cursor.visible = false;
+        }
+    }
+}
+```
+
+### Core/DamageInfo.cs
+
+```csharp
+using UnityEngine;
+
+namespace Lake.Core
+{
+    public readonly struct DamageInfo
+    {
+        public readonly float Amount;
+        public readonly Vector3 HitPoint;
+        public readonly Vector3 HitDirection;
+        public readonly GameObject Source;
+        public readonly HitZoneType Zone;
+
+        public DamageInfo(float amount, Vector3 hitPoint, Vector3 hitDirection,
+                          GameObject source, HitZoneType zone = HitZoneType.Body)
+        {
+            Amount = amount;
+            HitPoint = hitPoint;
+            HitDirection = hitDirection;
+            Source = source;
+            Zone = zone;
+        }
+    }
+
+    public enum HitZoneType { Body, Head, Limb }
+}
+```
+
+### Core/IDamageable.cs & IInteractable.cs
+
+```csharp
+using System;
+
+namespace Lake.Core
+{
+    public interface IDamageable
+    {
+        bool IsDead { get; }
+        void TakeDamage(DamageInfo info);
+        event Action<DamageInfo> OnDeath;
+    }
+
+    public interface IInteractable
+    {
+        string Prompt { get; }
+        bool CanInteract(GameObject interactor);
+        void Interact(GameObject interactor);
+    }
+}
+```
+
+### Aim/AimPivot.cs — **Сердце системы**
+
+```csharp
+using UnityEngine;
+using Lake.Core;
+
+namespace Lake.Aim
+{
+    /// <summary>
+    /// Невидимый прицел. Мышь вращает его напрямую.
+    /// Все предметы (оружие, фонарик) — дочерние. Куда смотрит AimPivot — туда стреляют.
+    /// Recoil добавляет временный offset к pitch/yaw.
+    /// </summary>
+    public class AimPivot : MonoBehaviour
+    {
+        [Header("Sensitivity")]
+        [SerializeField] float baseSensitivity = 2.2f;
+        [SerializeField] bool invertY = false;
+
+        [Header("Pitch Limits")]
+        [SerializeField] float minPitch = -85f;
+        [SerializeField] float maxPitch = 85f;
+
+        public Vector3 AimDirection => transform.forward;
+        public Vector3 AimOrigin => transform.position;
+
+        InputProvider _input;
+        float _basePitch;
+        float _baseYaw;
+        Vector2 _recoilOffset; // x=pitch, y=yaw (градусы)
+        float _sensitivityMultiplier = 1f;
+
+        public void SetSensitivityMultiplier(float m) => _sensitivityMultiplier = m;
+        public void AddRecoil(Vector2 pitchYawKick) => _recoilOffset += pitchYawKick;
+
+        void Start()
+        {
+            _input = InputProvider.Instance;
+            _baseYaw = transform.eulerAngles.y;
+            _basePitch = 0f;
+        }
+
+        void Update()
+        {
+            if (_input == null) return;
+
+            float sens = baseSensitivity * _sensitivityMultiplier;
+            _baseYaw += _input.LookInput.x * sens;
+            _basePitch += _input.LookInput.y * sens * (invertY ? 1f : -1f);
+
+            // Decay recoil
+            _recoilOffset = Vector2.Lerp(_recoilOffset, Vector2.zero, Time.deltaTime * 8f);
+            if (_recoilOffset.sqrMagnitude < 0.01f) _recoilOffset = Vector2.zero;
+
+            float finalPitch = Mathf.Clamp(_basePitch + _recoilOffset.x, minPitch, maxPitch);
+            transform.rotation = Quaternion.Euler(finalPitch, _baseYaw + _recoilOffset.y, 0f);
+        }
+    }
+}
+```
+
+### Aim/CameraFollower.cs — Камера с deadzone
+
+```csharp
+using UnityEngine;
+
+namespace Lake.Aim
+{
+    /// <summary>
+    /// Камера следует за AimPivot с задержкой. Пока угол между камерой и прицелом
+    /// меньше deadzoneAngle — камера стоит. Вышел прицел за пределы — камера догоняет.
+    /// Это создаёт "bodycam" ощущение: оружие водит в кадре, камера дёргается следом.
+    /// </summary>
+    public class CameraFollower : MonoBehaviour
+    {
+        [SerializeField] AimPivot aimPivot;
+
+        [Header("Deadzone")]
+        [SerializeField] float deadzoneAngle = 10f;    // градусы: свободная зона
+        [SerializeField] float followSpeed = 6f;        // скорость догона
+        [SerializeField] float maxFollowSpeedMultiplier = 3f;
+
+        void LateUpdate()
+        {
+            if (aimPivot == null) return;
+
+            float angle = Vector3.Angle(transform.forward, aimPivot.AimDirection);
+            if (angle <= deadzoneAngle) return;
+
+            // Чем дальше прицел от камеры — тем быстрее догоняем
+            float excess = angle - deadzoneAngle;
+            float speedMult = Mathf.Lerp(1f, maxFollowSpeedMultiplier, excess / 30f);
+            float t = Mathf.Clamp01(followSpeed * speedMult * Time.deltaTime);
+
+            transform.rotation = Quaternion.Slerp(transform.rotation, aimPivot.transform.rotation, t);
+        }
+    }
+}
+```
+
+### Aim/RecoilController.cs — Раздельная отдача
+
+```csharp
+using UnityEngine;
+using Lake.Core;
+
+namespace Lake.Aim
+{
+    /// <summary>
+    /// Два канала отдачи:
+    /// 1) AimPivot — реальный подброс прицела (влияет на попадание)
+    /// 2) Weapon visual — визуальный kickback модели (не влияет на попадание)
+    /// </summary>
+    public class RecoilController : MonoBehaviour
+    {
+        [SerializeField] AimPivot aimPivot;
+
+        public void ApplyRecoil(float vertical, float horizontal)
+        {
+            float h = Random.Range(-horizontal, horizontal);
+            aimPivot.AddRecoil(new Vector2(vertical, h));
+        }
+    }
+}
+```
+
+### Player/PlayerMotor.cs
+
+```csharp
+using UnityEngine;
+using Lake.Core;
+
+namespace Lake.Player
+{
+    [RequireComponent(typeof(CharacterController))]
+    public class PlayerMotor : MonoBehaviour
+    {
+        [SerializeField] Transform cameraTransform;
+        [SerializeField] float walkSpeed = 4f;
+        [SerializeField] float sprintSpeed = 7f;
+        [SerializeField] float crouchSpeed = 2.2f;
+        [SerializeField] float gravity = -20f;
+        [SerializeField] float jumpHeight = 1.2f;
+        [SerializeField] float crouchHeight = 1f;
+        [SerializeField] float standHeight = 1.8f;
+        [SerializeField] float crouchLerpSpeed = 10f;
+
+        CharacterController _cc;
+        InputProvider _input;
+        Vector3 _velocity;
+        float _targetHeight;
+
+        public bool IsGrounded => _cc.isGrounded;
+        public float HorizontalSpeed { get; private set; }
+
+        void Awake()
+        {
+            _cc = GetComponent<CharacterController>();
+            _cc.height = standHeight;
+            _cc.center = new Vector3(0f, standHeight * 0.5f, 0f);
+            _targetHeight = standHeight;
+        }
+
+        void Start() => _input = InputProvider.Instance;
+
+        void Update()
+        {
+            if (_input == null) return;
+            HandleCrouch();
+            HandleMovement();
+            HandleGravity();
+            _cc.Move(_velocity * Time.deltaTime);
+        }
+
+        void HandleMovement()
+        {
+            // Движение относительно камеры (вид игрока)
+            Vector3 camFwd = Vector3.ProjectOnPlane(cameraTransform.forward, Vector3.up).normalized;
+            Vector3 camRight = Vector3.ProjectOnPlane(cameraTransform.right, Vector3.up).normalized;
+            Vector2 move = _input.MoveInput;
+            Vector3 dir = (camRight * move.x + camFwd * move.y);
+
+            float speed = _input.Crouch ? crouchSpeed : (_input.Sprint ? sprintSpeed : walkSpeed);
+            HorizontalSpeed = dir.magnitude * speed;
+            _velocity.x = dir.x * speed;
+            _velocity.z = dir.z * speed;
+        }
+
+        void HandleGravity()
+        {
+            if (_cc.isGrounded && _velocity.y < 0f) _velocity.y = -2f;
+            else if (!_cc.isGrounded) _velocity.y += gravity * Time.deltaTime;
+
+            if (_cc.isGrounded && Input.GetKeyDown(KeyCode.Space))
+                _velocity.y = Mathf.Sqrt(jumpHeight * -2f * gravity);
+        }
+
+        void HandleCrouch()
+        {
+            _targetHeight = _input.Crouch ? crouchHeight : standHeight;
+            _cc.height = Mathf.Lerp(_cc.height, _targetHeight, Time.deltaTime * crouchLerpSpeed);
+            _cc.center = new Vector3(0f, _cc.height * 0.5f, 0f);
+        }
+    }
+}
+```
+
+### Player/BodyFollower.cs — Тело следует за прицелом
+
+```csharp
+using UnityEngine;
+using Lake.Aim;
+
+namespace Lake.Player
+{
+    /// <summary>
+    /// Тело игрока медленно поворачивается в сторону AimPivot.
+    /// Это то, что даёт эффект "руки ведут, тело догоняет".
+    /// </summary>
+    public class BodyFollower : MonoBehaviour
+    {
+        [SerializeField] AimPivot aimPivot;
+        [SerializeField] float followSpeed = 4f;
+
+        void LateUpdate()
+        {
+            if (aimPivot == null) return;
+            Vector3 pivotFwd = Vector3.ProjectOnPlane(aimPivot.AimDirection, Vector3.up);
+            if (pivotFwd.sqrMagnitude < 0.01f) return;
+
+            Quaternion target = Quaternion.LookRotation(pivotFwd, Vector3.up);
+            transform.rotation = Quaternion.Slerp(transform.rotation, target, Time.deltaTime * followSpeed);
+        }
+    }
+}
+```
+
+### Player/CameraEffects.cs
+
+```csharp
+using UnityEngine;
+using Lake.Core;
+
+namespace Lake.Player
+{
+    /// <summary>
+    /// Head bob + tilt. Пишет в CameraContainer (родитель камеры), НЕ в AimPivot.
+    /// </summary>
+    public class CameraEffects : MonoBehaviour
+    {
+        [SerializeField] Transform cameraContainer;
+        [SerializeField] PlayerMotor motor;
+        [SerializeField] float bobFrequency = 8f;
+        [SerializeField] float bobAmplitudeX = 0.025f;
+        [SerializeField] float bobAmplitudeY = 0.04f;
+        [SerializeField] float tiltAmount = 2f;
+
+        InputProvider _input;
+        Vector3 _bobOffset;
+        float _bobTimer;
+        float _tilt;
+
+        void Start() => _input = InputProvider.Instance;
+
+        void LateUpdate()
+        {
+            if (_input == null || motor == null) return;
+
+            bool moving = motor.IsGrounded && motor.HorizontalSpeed > 0.1f;
+            if (moving)
+            {
+                _bobTimer += Time.deltaTime * bobFrequency;
+                _bobOffset = Vector3.Lerp(_bobOffset,
+                    new Vector3(Mathf.Sin(_bobTimer) * bobAmplitudeX,
+                                Mathf.Sin(_bobTimer * 2f) * bobAmplitudeY, 0f),
+                    Time.deltaTime * 12f);
+            }
+            else _bobOffset = Vector3.Lerp(_bobOffset, Vector3.zero, Time.deltaTime * 10f);
+
+            float targetTilt = -_input.MoveInput.x * tiltAmount;
+            _tilt = Mathf.Lerp(_tilt, targetTilt, Time.deltaTime * 8f);
+
+            cameraContainer.localPosition = _bobOffset;
+            cameraContainer.localRotation = Quaternion.Euler(0f, 0f, _tilt);
+        }
+    }
+}
+```
+
+### Player/PlayerHealth.cs
+
+```csharp
+using UnityEngine;
+using Lake.Health;
+
+namespace Lake.Player
+{
+    public class PlayerHealth : MonoBehaviour
+    {
+        [SerializeField] HealthComponent health;
+
+        void Awake() { if (health == null) health = GetComponent<HealthComponent>(); }
+    }
+}
+```
+
+### Player/PlayerSpawner.cs
+
+```csharp
+using System.Collections;
+using UnityEngine;
+using Lake.Health;
+
+namespace Lake.Player
+{
+    public class PlayerSpawner : MonoBehaviour
+    {
+        [SerializeField] GameObject playerPrefab;
+        [SerializeField] SpawnPoint[] spawnPoints;
+        [SerializeField] float respawnDelay = 2f;
+
+        PlayerSpawner _instance;
+        GameObject _current;
+
+        void Start() => Spawn();
+
+        public void Spawn()
+        {
+            Vector3 pos = new(0f, 1.1f, -20f);
+            Quaternion rot = Quaternion.identity;
+            if (spawnPoints != null && spawnPoints.Length > 0)
+            {
+                var sp = spawnPoints[Random.Range(0, spawnPoints.Length)];
+                pos = sp.transform.position;
+                rot = sp.transform.rotation;
+            }
+
+            _current = Instantiate(playerPrefab, pos, rot);
+            var health = _current.GetComponent<HealthComponent>();
+            if (health != null)
+                health.OnDeath += _ => StartCoroutine(RespawnRoutine());
+        }
+
+        IEnumerator RespawnRoutine()
+        {
+            yield return new WaitForSeconds(respawnDelay);
+            if (_current != null) Destroy(_current);
+            Spawn();
+        }
+    }
+}
+```
+
+### Player/PlayerInteractor.cs — Исправленный E
+
+```csharp
+using UnityEngine;
+using Lake.Core;
+
+namespace Lake.Player
+{
+    /// <summary>
+    /// Raycast из AimPivot (не из камеры!) — то, куда игрок смотрит оружием.
+    /// Подписка на InputProvider в OnEnable — фикс бага "E не работает".
+    /// </summary>
+    public class PlayerInteractor : MonoBehaviour
+    {
+        [SerializeField] Transform rayOrigin;
+        [SerializeField] float interactRange = 3f;
+        [SerializeField] LayerMask interactMask = ~0;
+
+        IInteractable _current;
+
+        void OnEnable()
+        {
+            if (InputProvider.Instance != null)
+                InputProvider.Instance.InteractPressed += OnInteract;
+        }
+
+        void OnDisable()
+        {
+            if (InputProvider.Instance != null)
+                InputProvider.Instance.InteractPressed -= OnInteract;
+        }
+
+        void Update()
+        {
+            if (rayOrigin == null) return;
+            if (Physics.Raycast(rayOrigin.position, rayOrigin.forward, out var hit,
+                                interactRange, interactMask, QueryTriggerInteraction.Collide))
+                _current = hit.collider.GetComponentInParent<IInteractable>();
+            else _current = null;
+        }
+
+        void OnInteract()
+        {
+            if (_current != null && _current.CanInteract(gameObject))
+                _current.Interact(gameObject);
+        }
+    }
+}
+```
+
+### Weapons/WeaponType.cs
+
+```csharp
+namespace Lake.Weapons { public enum WeaponType { Rifle = 0, Shotgun = 1 } }
+```
+
+### Weapons/WeaponDataSO.cs
+
+```csharp
+using UnityEngine;
+
+namespace Lake.Weapons
+{
+    [CreateAssetMenu(fileName = "WeaponData", menuName = "Lake/Weapon Data")]
+    public class WeaponDataSO : ScriptableObject
+    {
+        [Header("Identity")]
+        public WeaponType type;
+        public string displayName = "Weapon";
+
+        [Header("Firing")]
+        public bool isAutomatic = true;
+        public float fireRate = 0.15f;
+        [Range(1, 32)] public int pelletsPerShot = 1;
+        public float damagePerPellet = 25f;
+        public float range = 100f;
+        public LayerMask hitMask = ~0;
+
+        [Header("Spread")]
+        public float baseSpread = 0.5f;
+        public float spreadPerShot = 0.3f;
+        public float maxSpread = 4f;
+        public float spreadRecovery = 4f;
+        public float adsSpreadMultiplier = 0.2f;
+
+        [Header("Falloff")]
+        public float falloffStart = 30f;
+        public float falloffEnd = 80f;
+        [Range(0f, 1f)] public float minDamageMultiplier = 0.25f;
+
+        [Header("Recoil")]
+        public float recoilVertical = 1.5f;
+        public float recoilHorizontal = 0.3f;
+        public float visualKickback = 0.08f;
+
+        [Header("Ammo")]
+        public int magazineSize = 30;
+        public int reserveAmmoMax = 120;
+        public float reloadTime = 2.5f;
+        public bool shellByShellReload = false;
+        public float shellReloadTime = 0.5f;
+
+        [Header("ADS")]
+        public Vector3 hipPosition = new(0.25f, -0.25f, 0.4f);
+        public Vector3 adsPosition = new(0f, -0.12f, 0.3f);
+        public float hipFov = 65f;
+        public float adsFov = 50f;
+        public float adsSensitivityMultiplier = 0.55f;
+
+        public float TotalDamage => damagePerPellet * pelletsPerShot;
+
+        public float ComputeFalloff(float distance)
+        {
+            if (distance <= falloffStart) return 1f;
+            if (distance >= falloffEnd) return minDamageMultiplier;
+            float t = Mathf.InverseLerp(falloffStart, falloffEnd, distance);
+            return Mathf.Lerp(1f, minDamageMultiplier, t);
+        }
+    }
+}
+```
+
+### Weapons/WeaponRuntime.cs — Ядро боевой системы
+
+```csharp
+using System.Collections;
+using UnityEngine;
+using Lake.Core;
+using Lake.Aim;
+
+namespace Lake.Weapons
+{
+    /// <summary>
+    /// Один экземпляр оружия. Raycast от muzzlePoint.position в aimPivot.forward.
+    /// Учитывает spread, falloff, hit zones, split recoil.
+    /// </summary>
+    public class WeaponRuntime : MonoBehaviour
+    {
+        [SerializeField] WeaponDataSO data;
+        [SerializeField] Transform muzzlePoint;
+        [SerializeField] AimPivot aimPivot;
+        [SerializeField] RecoilController recoil;
+        [SerializeField] GameObject muzzleFlashPrefab;
+        [SerializeField] LineRenderer tracerPrefab;
+        [SerializeField] float tracerDuration = 0.08f;
+        [SerializeField] LayerMask muzzleBlockMask = ~0;
+
+        public WeaponDataSO Data => data;
+        public int CurrentAmmo { get; private set; }
+        public int ReserveAmmo { get; private set; }
+        public bool IsReloading { get; private set; }
+
+        public event System.Action<int, int> OnAmmoChanged;
+
+        InputProvider _input;
+        float _nextFireTime;
+        float _currentSpread;
+        Coroutine _reloadRoutine;
+        bool _isAds;
+
+        public void Initialize()
+        {
+            _input = InputProvider.Instance;
+            CurrentAmmo = data.magazineSize;
+            ReserveAmmo = data.reserveAmmoMax;
+            OnAmmoChanged?.Invoke(CurrentAmmo, ReserveAmmo);
+
+            _input.FireStarted += OnFirePress;
+            _input.FireStopped += OnFireRelease;
+            _input.ReloadPressed += OnReloadPress;
+            _input.ADSStarted += () => _isAds = true;
+            _input.ADSEnded += () => _isAds = false;
+        }
+
+        void OnDestroy()
+        {
+            if (_input == null) return;
+            _input.FireStarted -= OnFirePress;
+            _input.FireStopped -= OnFireRelease;
+            _input.ReloadPressed -= OnReloadPress;
+        }
+
+        void OnFirePress()
+        {
+            if (data.isAutomatic) StartCoroutine(AutoFireLoop());
+            else TryFire();
+        }
+
+        void OnFireRelease() => StopAllCoroutines();
+
+        IEnumerator AutoFireLoop()
+        {
+            while (_input.FireHeld)
+            {
+                TryFire();
+                yield return new WaitForSeconds(data.fireRate);
+            }
+        }
+
+        void OnReloadPress()
+        {
+            if (IsReloading || CurrentAmmo >= data.magazineSize || ReserveAmmo <= 0) return;
+            if (data.shellByShellReload) _reloadRoutine = StartCoroutine(ShellReloadRoutine());
+            else _reloadRoutine = StartCoroutine(BulkReloadRoutine());
+        }
+
+        IEnumerator BulkReloadRoutine()
+        {
+            IsReloading = true;
+            yield return new WaitForSeconds(data.reloadTime);
+            int need = data.magazineSize - CurrentAmmo;
+            int take = Mathf.Min(need, ReserveAmmo);
+            CurrentAmmo += take;
+            ReserveAmmo -= take;
+            OnAmmoChanged?.Invoke(CurrentAmmo, ReserveAmmo);
+            IsReloading = false;
+        }
+
+        IEnumerator ShellReloadRoutine()
+        {
+            IsReloading = true;
+            while (CurrentAmmo < data.magazineSize && ReserveAmmo > 0)
+            {
+                yield return new WaitForSeconds(data.shellReloadTime);
+                if (_input.FireHeld) { IsReloading = false; yield break; } // прервано стрельбой
+                CurrentAmmo++;
+                ReserveAmmo--;
+                OnAmmoChanged?.Invoke(CurrentAmmo, ReserveAmmo);
+            }
+            IsReloading = false;
+        }
+
+        void TryFire()
+        {
+            if (IsReloading || Time.time < _nextFireTime || CurrentAmmo <= 0) return;
+
+            _nextFireTime = Time.time + data.fireRate;
+            CurrentAmmo--;
+            OnAmmoChanged?.Invoke(CurrentAmmo, ReserveAmmo);
+
+            for (int i = 0; i < data.pelletsPerShot; i++) FirePellet();
+
+            // Split recoil
+            recoil.ApplyRecoil(data.recoilVertical, data.recoilHorizontal);
+            _currentSpread = Mathf.Min(_currentSpread + data.spreadPerShot, data.maxSpread);
+
+            if (muzzleFlashPrefab != null && muzzlePoint != null)
+                Instantiate(muzzleFlashPrefab, muzzlePoint.position, muzzlePoint.rotation, muzzlePoint);
+        }
+
+        void FirePellet()
+        {
+            Vector3 origin = muzzlePoint.position;
+            Vector3 dir = ApplySpread(aimPivot.AimDirection, ComputeSpread());
+
+            // Если дуло "в стене" — сдвигаем к aimPivot
+            if (Physics.Linecast(aimPivot.AimOrigin, origin, out var block, muzzleBlockMask))
+                origin = aimPivot.AimOrigin + (origin - aimPivot.AimOrigin).normalized * (block.distance * 0.9f);
+
+            Vector3 hitPoint = origin + dir * data.range;
+            if (Physics.Raycast(origin, dir, out var hit, data.range, data.hitMask))
+            {
+                hitPoint = hit.point;
+                float falloff = data.ComputeFalloff(hit.distance);
+                float dmg = data.damagePerPellet * falloff;
+
+                var zone = hit.collider.GetComponent<HitZone>();
+                if (zone != null) dmg *= zone.Multiplier;
+
+                var dmgable = hit.collider.GetComponentInParent<IDamageable>();
+                if (dmgable != null)
+                    dmgable.TakeDamage(new DamageInfo(dmg, hit.point, dir, gameObject,
+                        zone != null ? zone.ZoneType : HitZoneType.Body));
+            }
+
+            SpawnTracer(origin, hitPoint);
+        }
+
+        float ComputeSpread()
+        {
+            float s = data.baseSpread + _currentSpread;
+            if (_isAds) s *= data.adsSpreadMultiplier;
+            return s;
+        }
+
+        static Vector3 ApplySpread(Vector3 forward, float angleDeg)
+        {
+            if (angleDeg <= 0.01f) return forward;
+            float rad = angleDeg * Mathf.Deg2Rad;
+            Vector2 rnd = Random.insideUnitCircle * Mathf.Tan(rad);
+            return (forward + new Vector3(rnd.x, rnd.y, 0f)).normalized;
+        }
+
+        void SpawnTracer(Vector3 from, Vector3 to)
+        {
+            if (tracerPrefab == null) return;
+            var t = Instantiate(tracerPrefab);
+            t.SetPosition(0, from);
+            t.SetPosition(1, to);
+            Destroy(t.gameObject, tracerDuration);
+        }
+
+        void Update()
+        {
+            _currentSpread = Mathf.MoveTowards(_currentSpread, 0f, data.spreadRecovery * Time.deltaTime);
+        }
+    }
+}
+```
+
+### Weapons/HitZone.cs
+
+```csharp
+using UnityEngine;
+using Lake.Core;
+
+namespace Lake.Weapons
+{
+    public class HitZone : MonoBehaviour
+    {
+        public HitZoneType ZoneType = HitZoneType.Body;
+        public float Multiplier = 1f;
+    }
+}
+```
+
+### Weapons/WeaponController.cs
+
+```csharp
+using System;
+using UnityEngine;
+using Lake.Core;
+
+namespace Lake.Weapons
+{
+    public class WeaponController : MonoBehaviour
+    {
+        [SerializeField] Transform weaponHolder;
+        [SerializeField] Transform aimPivotTransform;
+
+        readonly GameObject[] _instances = new GameObject[2];
+        readonly WeaponRuntime[] _runtimes = new WeaponRuntime[2];
+        readonly WeaponDataSO[] _data = new WeaponDataSO[2];
+
+        int _current = -1;
+        InputProvider _input;
+
+        public WeaponRuntime Current => _current >= 0 ? _runtimes[_current] : null;
+        public event Action<int> OnSlotChanged;
+
+        void Start()
+        {
+            _input = InputProvider.Instance;
+            _input.WeaponSlotPressed += OnSlotPressed;
+            _input.DropPressed += DropCurrent;
+        }
+
+        void OnDestroy()
+        {
+            if (_input == null) return;
+            _input.WeaponSlotPressed -= OnSlotPressed;
+            _input.DropPressed -= DropCurrent;
+        }
+
+        void OnSlotPressed(int slot)
+        {
+            if (slot < 0 || slot >= 2 || _instances[slot] == null) return;
+            SwitchTo(slot);
+        }
+
+        public bool TryAddWeapon(WeaponType type, GameObject prefab, WeaponDataSO data)
+        {
+            int slot = (int)type;
+            if (_instances[slot] != null) return false;
+
+            var inst = Instantiate(prefab, weaponHolder);
+            inst.transform.localPosition = data.hipPosition;
+            inst.transform.localRotation = Quaternion.identity;
+
+            var rt = inst.GetComponent<WeaponRuntime>();
+            if (rt == null) { Destroy(inst); return false; }
+
+            _instances[slot] = inst;
+            _runtimes[slot] = rt;
+            _data[slot] = data;
+            inst.SetActive(false);
+            rt.Initialize();
+            SwitchTo(slot);
+            return true;
+        }
+
+        void SwitchTo(int slot)
+        {
+            if (slot == _current || _instances[slot] == null) return;
+            if (_current >= 0 && _instances[_current] != null) _instances[_current].SetActive(false);
+            _current = slot;
+            _instances[slot].SetActive(true);
+            OnSlotChanged?.Invoke(slot);
+        }
+
+        public void DropCurrent()
+        {
+            if (_current < 0) return;
+            var inst = _instances[_current];
+            if (inst == null) return;
+
+            inst.transform.SetParent(null);
+            var rb = inst.AddComponent<Rigidbody>();
+            rb.mass = 2f;
+            inst.AddComponent<BoxCollider>().size = new Vector3(0.3f, 0.15f, 1f);
+            inst.SetActive(true);
+            rb.AddForce(aimPivotTransform.forward * 5f + Vector3.up * 1.5f, ForceMode.Impulse);
+
+            var pickup = inst.AddComponent<WeaponPickup>();
+            pickup.Setup((WeaponType)_current, _data[_current]);
+
+            _instances[_current] = null;
+            _runtimes[_current] = null;
+            _data[_current] = null;
+            _current = -1;
+
+            for (int i = 0; i < 2; i++)
+                if (_instances[i] != null) { SwitchTo(i); return; }
+        }
+    }
+}
+```
+
+### Weapons/WeaponPickup.cs — Исправленный
+
+```csharp
+using UnityEngine;
+using Lake.Core;
+
+namespace Lake.Weapons
+{
+    public class WeaponPickup : MonoBehaviour, IInteractable
+    {
+        [SerializeField] WeaponType type;
+        [SerializeField] WeaponDataSO data;
+        [SerializeField] GameObject weaponPrefab;
+        [SerializeField] string displayName = "Weapon";
+
+        public string Prompt => $"E - Pick up {displayName}";
+
+        public bool CanInteract(GameObject interactor) =>
+            interactor.GetComponentInParent<WeaponController>() != null;
+
+        public void Interact(GameObject interactor)
+        {
+            var wc = interactor.GetComponentInParent<WeaponController>();
+            if (wc == null) return;
+            var prefab = weaponPrefab != null ? weaponPrefab : gameObject;
+            if (wc.TryAddWeapon(type, prefab, data)) Destroy(gameObject);
+        }
+
+        public void Setup(WeaponType t, WeaponDataSO d)
+        {
+            type = t;
+            data = d;
+            displayName = d != null ? d.displayName : t.ToString();
+            weaponPrefab = null; // drop-режим: gameObject сам является префабом-инстансом
+        }
+    }
+}
+```
+
+### Weapons/WeaponSway.cs + ADSController.cs
+
+```csharp
+using UnityEngine;
+using Lake.Core;
+
+namespace Lake.Weapons
+{
+    /// <summary>Визуальный sway модели. НЕ влияет на raycast.</summary>
+    public class WeaponSway : MonoBehaviour
+    {
+        [SerializeField] float swayAmount = 0.04f;
+        [SerializeField] float swaySmoothing = 6f;
+
+        Vector3 _basePos;
+        InputProvider _input;
+
+        void Awake() => _basePos = transform.localPosition;
+        void Start() => _input = InputProvider.Instance;
+
+        void Update()
+        {
+            if (_input == null) return;
+            Vector3 target = _basePos + new Vector3(
+                -_input.LookInput.x * swayAmount,
+                -_input.LookInput.y * swayAmount, 0f);
+            transform.localPosition = Vector3.Lerp(transform.localPosition, target,
+                Time.deltaTime * swaySmoothing);
+        }
+    }
+}
+
+namespace Lake.Weapons
+{
+    using Lake.Aim;
+
+    public class ADSController : MonoBehaviour
+    {
+        [SerializeField] WeaponController weaponController;
+        [SerializeField] AimPivot aimPivot;
+        [SerializeField] Camera camera;
+        [SerializeField] Transform weaponHolder;
+
+        bool _ads;
+        float _t;
+
+        void OnEnable()
+        {
+            if (InputProvider.Instance == null) return;
+            InputProvider.Instance.ADSStarted += OnADSStart;
+            InputProvider.Instance.ADSEnded += OnADSEnd;
+        }
+
+        void OnDisable()
+        {
+            if (InputProvider.Instance == null) return;
+            InputProvider.Instance.ADSStarted -= OnADSStart;
+            InputProvider.Instance.ADSEnded -= OnADSEnd;
+        }
+
+        void OnADSStart() => _ads = true;
+        void OnADSEnd() => _ads = false;
+
+        void Update()
+        {
+            var w = weaponController.Current;
+            if (w == null || w.Data == null) return;
+
+            _t = Mathf.MoveTowards(_t, _ads ? 1f : 0f, Time.deltaTime * 10f);
+
+            if (weaponHolder != null)
+                weaponHolder.localPosition = Vector3.Lerp(w.Data.hipPosition, w.Data.adsPosition, _t);
+
+            if (camera != null)
+                camera.fieldOfView = Mathf.Lerp(w.Data.hipFov, w.Data.adsFov, _t);
+
+            aimPivot.SetSensitivityMultiplier(
+                Mathf.Lerp(1f, w.Data.adsSensitivityMultiplier, _t));
+        }
+    }
+}
+```
+
+### Weapons/VFX/MuzzleFlash.cs + MuzzleFlashLight.cs + TracerLine.cs
+
+```csharp
+using UnityEngine;
+
+namespace Lake.Weapons.VFX
+{
+    [RequireComponent(typeof(ParticleSystem))]
+    public class MuzzleFlash : MonoBehaviour
+    {
+        ParticleSystem _ps;
+        void Awake() { _ps = GetComponent<ParticleSystem>(); _ps.Play(); Destroy(gameObject, 0.15f); }
+    }
+
+    /// <summary>Point light на 0.05 сек — освещает комнату при выстреле (Bodycam фишка).</summary>
+    public class MuzzleFlashLight : MonoBehaviour
+    {
+        [SerializeField] float intensity = 12f;
+        [SerializeField] float range = 4f;
+        [SerializeField] float duration = 0.05f;
+
+        Light _light;
+        float _t;
+
+        void Awake()
+        {
+            _light = gameObject.AddComponent<Light>();
+            _light.type = LightType.Point;
+            _light.color = new Color(1f, 0.85f, 0.5f);
+            _light.intensity = intensity;
+            _light.range = range;
+            _light.shadows = LightShadows.None;
+        }
+
+        void Update()
+        {
+            _t += Time.deltaTime;
+            _light.intensity = Mathf.Lerp(intensity, 0f, _t / duration);
+            if (_t >= duration) Destroy(gameObject);
+        }
+    }
+
+    [RequireComponent(typeof(LineRenderer))]
+    public class TracerLine : MonoBehaviour
+    {
+        LineRenderer _lr;
+        void Awake() => _lr = GetComponent<LineRenderer>();
+        public void SetPosition(int i, Vector3 p) => _lr.SetPosition(i, p);
+    }
+}
+```
+
+### Flashlight/BatteryStrategies.cs
+
+```csharp
+using System;
+using UnityEngine;
+
+namespace Lake.Flashlight
+{
+    public interface IBatteryStrategy
+    {
+        float CurrentLevel { get; }
+        bool CanUse { get; }
+        void Tick(float dt, bool isOn);
+        void Reset();
+    }
+
+    [Serializable]
+    public class InfiniteBattery : IBatteryStrategy
+    {
+        public float CurrentLevel => 1f;
+        public bool CanUse => true;
+        public void Tick(float dt, bool isOn) { }
+        public void Reset() { }
+    }
+
+    [Serializable]
+    public class LinearDrainBattery : IBatteryStrategy
+    {
+        [SerializeField] float drainPerSecond = 0.5f;
+        [SerializeField] float rechargePerSecond = 1f;
+
+        float _level = 1f;
+        public float CurrentLevel => _level;
+        public bool CanUse => _level > 0f;
+
+        public void Tick(float dt, bool isOn)
+        {
+            if (isOn) _level = Mathf.Max(0f, _level - drainPerSecond * dt);
+            else _level = Mathf.Min(1f, _level + rechargePerSecond * dt);
+        }
+
+        public void Reset() => _level = 1f;
+    }
+}
+```
+
+### Flashlight/Flashlight.cs
+
+```csharp
+using UnityEngine;
+using Lake.Core;
+
+namespace Lake.Flashlight
+{
+    [RequireComponent(typeof(Light))]
+    public class Flashlight : MonoBehaviour
+    {
+        [SerializeField] bool useBattery = false;
+        [SerializeField] LinearDrainBattery battery = new();
+        [SerializeField] float onIntensity = 5f;
+        [SerializeField] float onRange = 50f;
+        [SerializeField] float onSpotAngle = 45f;
+        [SerializeField] Color lightColor = new(1f, 0.95f, 0.85f);
+        [SerializeField] bool enableFlicker = true;
+        [SerializeField] float flickerAmplitude = 0.1f;
+        [SerializeField] float flickerSpeed = 8f;
+
+        Light _light;
+        InputProvider _input;
+        bool _isOn;
+        float _phase;
+
+        IBatteryStrategy Battery => useBattery ? battery : new InfiniteBattery();
+
+        void Awake()
+        {
+            _light = GetComponent<Light>();
+            _light.type = LightType.Spot;
+            _light.color = lightColor;
+            _light.range = onRange;
+            _light.spotAngle = onSpotAngle;
+            _light.shadows = LightShadows.Soft;
+            _light.enabled = false;
+        }
+
+        void OnEnable()
+        {
+            if (InputProvider.Instance != null)
+                InputProvider.Instance.FlashlightPressed += Toggle;
+            _phase = Random.value * 100f;
+        }
+
+        void OnDisable()
+        {
+            if (InputProvider.Instance != null)
+                InputProvider.Instance.FlashlightPressed -= Toggle;
+        }
+
+        void Toggle() => SetOn(!_isOn);
+
+        public void SetOn(bool on)
+        {
+            if (on && !Battery.CanUse) return;
+            _isOn = on;
+            _light.enabled = on;
+        }
+
+        void Update()
+        {
+            Battery.Tick(Time.deltaTime, _isOn);
+            if (_isOn && !Battery.CanUse) { SetOn(false); return; }
+            if (!_isOn) return;
+
+            if (!enableFlicker) { _light.intensity = onIntensity; return; }
+
+            _phase += Time.deltaTime * flickerSpeed;
+            float n = Mathf.PerlinNoise(_phase, 0f) - 0.5f;
+            float level = useBattery ? Mathf.Lerp(0.4f, 1f, Battery.CurrentLevel) : 1f;
+            _light.intensity = onIntensity * level * (1f + n * 2f * flickerAmplitude);
+        }
+    }
+}
+```
+
+### BodyCam/BodyCamConfigSO.cs + BodyCamController.cs
+
+```csharp
+using UnityEngine;
+
+namespace Lake.BodyCam
+{
+    [CreateAssetMenu(fileName = "BodyCamConfig", menuName = "Lake/BodyCam Config")]
+    public class BodyCamConfigSO : ScriptableObject
+    {
+        public float lensDistortion = 0.25f;
+        public float lensScale = 0.95f;
+        public float chromaticAberration = 0.15f;
+        public float vignette = 0.35f;
+        public float filmGrain = 0.4f;
+        public float saturation = -12f;
+        public float contrast = 5f;
+        public float motionBlur = 0.15f;
+        public float bloom = 0.1f;
+    }
+}
+
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.HighDefinition;
+using Lake.Core;
+
+namespace Lake.BodyCam
+{
+    public class BodyCamController : MonoBehaviour
+    {
+        [SerializeField] BodyCamConfigSO config;
+        [SerializeField] bool enabled_ = true;
+
+        VolumeProfile _profile;
+        LensDistortion _lens;
+        ChromaticAberration _ca;
+        Vignette _vig;
+        FilmGrain _grain;
+        ColorAdjustments _color;
+        MotionBlur _motion;
+        Bloom _bloom;
+
+        void Awake()
+        {
+            if (config == null) config = ScriptableObject.CreateInstance<BodyCamConfigSO>();
+            var vol = GetComponent<Volume>() ?? gameObject.AddComponent<Volume>();
+            vol.isGlobal = true;
+            vol.priority = 100f;
+            vol.weight = 1f;
+            _profile = ScriptableObject.CreateInstance<VolumeProfile>();
+            vol.profile = _profile;
+
+            _lens = _profile.Add<LensDistortion>(true);
+            _ca = _profile.Add<ChromaticAberration>(true);
+            _vig = _profile.Add<Vignette>(true);
+            _grain = _profile.Add<FilmGrain>(true);
+            _color = _profile.Add<ColorAdjustments>(true);
+            _motion = _profile.Add<MotionBlur>(true);
+            _bloom = _profile.Add<Bloom>(true);
+        }
+
+        void OnEnable()
+        {
+            if (InputProvider.Instance != null)
+                InputProvider.Instance.BodyCamTogglePressed += Toggle;
+        }
+
+        void OnDisable()
+        {
+            if (InputProvider.Instance != null)
+                InputProvider.Instance.BodyCamTogglePressed -= Toggle;
+        }
+
+        void Toggle() => enabled_ = !enabled_;
+
+        void Update()
+        {
+            float k = enabled_ ? 1f : 0f;
+            if (_lens != null) { _lens.intensity.Override(config.lensDistortion * k); _lens.scale.Override(Mathf.Lerp(1f, config.lensScale, k)); }
+            if (_ca != null) _ca.intensity.Override(config.chromaticAberration * k);
+            if (_vig != null) _vig.intensity.Override(config.vignette * k);
+            if (_grain != null) _grain.intensity.Override(config.filmGrain * k);
+            if (_color != null) { _color.saturation.Override(config.saturation * k); _color.contrast.Override(config.contrast * k); }
+            if (_motion != null) _motion.intensity.Override(config.motionBlur * k);
+            if (_bloom != null) _bloom.intensity.Override(config.bloom * k);
+        }
+    }
+}
+```
+
+### Health/HealthComponent.cs
+
+```csharp
+using System;
+using UnityEngine;
+using Lake.Core;
+
+namespace Lake.Health
+{
+    public class HealthComponent : MonoBehaviour, IDamageable
+    {
+        [SerializeField] float maxHealth = 100f;
+        [SerializeField] bool destroyOnDeath = false;
+        [SerializeField] float destroyDelay = 2f;
+
+        public float Current { get; private set; }
+        public bool IsDead { get; private set; }
+        public event Action<DamageInfo> OnDeath;
+        public event Action<float, float> OnHealthChanged;
+
+        void Awake() => Current = maxHealth;
+
+        public void TakeDamage(DamageInfo info)
+        {
+            if (IsDead) return;
+            Current = Mathf.Max(0f, Current - info.Amount);
+            OnHealthChanged?.Invoke(Current, maxHealth);
+            if (Current <= 0f)
+            {
+                IsDead = true;
+                OnDeath?.Invoke(info);
+                if (destroyOnDeath) Destroy(gameObject, destroyDelay);
+            }
+        }
+
+        public void ResetHealth() { IsDead = false; Current = maxHealth; OnHealthChanged?.Invoke(Current, maxHealth); }
+    }
+}
+```
+
+### Scene/SpawnPoint.cs + TestTarget.cs
+
+```csharp
+using UnityEngine;
+
+namespace Lake.Player { public class SpawnPoint : MonoBehaviour { } }
+
+namespace Lake.Scene
+{
+    using Lake.Health;
+    using Lake.Core;
+
+    [RequireComponent(typeof(HealthComponent))]
+    public class TestTarget : MonoBehaviour
+    {
+        [SerializeField] Renderer renderer;
+        [SerializeField] Color hitColor = Color.red;
+        HealthComponent _hc;
+        MaterialPropertyBlock _mpb;
+
+        void Awake()
+        {
+            _hc = GetComponent<HealthComponent>();
+            _mpb = new MaterialPropertyBlock();
+            if (renderer == null) renderer = GetComponentInChildren<Renderer>();
+        }
+
+        void Start()
+        {
+            _hc.OnHealthChanged += (_, __) => Flash(hitColor);
+            _hc.OnDeath += _ => Flash(Color.black);
+        }
+
+        void Flash(Color c)
+        {
+            if (renderer == null) return;
+            renderer.GetPropertyBlock(_mpb);
+            _mpb.SetColor("_BaseColor", c);
+            renderer.SetPropertyBlock(_mpb);
+        }
+    }
+}
+```
+
+### Scene/HorrorSceneBuilder.cs
+
+```csharp
+using UnityEngine;
+using Lake.Player;
+using Lake.Weapons;
+using Lake.Health;
+using Lake.BodyCam;
+using Lake.Flashlight;
+
+namespace Lake.Scene
+{
+    public class HorrorSceneBuilder : MonoBehaviour
+    {
+        [SerializeField] GameObject playerPrefab;
+        [SerializeField] WeaponDataSO rifleData;
+        [SerializeField] WeaponDataSO shotgunData;
+        [SerializeField] GameObject riflePrefab;
+        [SerializeField] GameObject shotgunPrefab;
+        [SerializeField] BodyCamConfigSO bodyCamConfig;
+
+        [ContextMenu("Generate Scene")]
+        public void GenerateScene()
+        {
+            ClearAll();
+            CreateGround(); CreateForest(); CreateCave(); CreateLighting();
+            CreateBodyCamVolume(); CreatePlayer(); CreateWeaponPickups(); CreateTargets();
+        }
+
+        void ClearAll()
+        {
+            foreach (var name in new[] { "Generated_Ground", "Generated_Forest", "Generated_Cave",
+                "Generated_Lighting", "Generated_BodyCam", "Generated_Player", "Generated_Pickups", "Generated_Targets" })
+            {
+                var obj = GameObject.Find(name);
+                if (obj != null) DestroyImmediate(obj);
+            }
+        }
+
+        void CreateGround()
+        {
+            var root = new GameObject("Generated_Ground");
+            var plane = GameObject.CreatePrimitive(PrimitiveType.Plane);
+            plane.transform.SetParent(root.transform);
+            plane.transform.localScale = new Vector3(5f, 1f, 5f);
+            plane.tag = "Ground";
+        }
+
+        void CreateForest()
+        {
+            var root = new GameObject("Generated_Forest");
+            var rng = new System.Random(42);
+            for (int i = 0; i < 60; i++)
+            {
+                float a = (float)rng.NextDouble() * Mathf.PI * 2f;
+                float r = 10f + (float)rng.NextDouble() * 18f;
+                Vector3 pos = new(Mathf.Cos(a) * r, 0f, Mathf.Sin(a) * r);
+                var trunk = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+                trunk.transform.SetParent(root.transform);
+                trunk.transform.position = pos + Vector3.up * 2f;
+                trunk.transform.localScale = new Vector3(0.3f, 2f, 0.3f);
+                var crown = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                crown.transform.SetParent(root.transform);
+                crown.transform.position = pos + Vector3.up * 5f;
+                crown.transform.localScale = Vector3.one * 3f;
+                DestroyImmediate(crown.GetComponent<Collider>());
+            }
+        }
+
+        void CreateCave()
+        {
+            var root = new GameObject("Generated_Cave");
+            Wall(root, new Vector3(-4f, 2.5f, 20f), new Vector3(0.5f, 5f, 30f));
+            Wall(root, new Vector3(4f, 2.5f, 20f), new Vector3(0.5f, 5f, 30f));
+            Wall(root, new Vector3(0f, 5f, 20f), new Vector3(8.5f, 0.5f, 30f));
+        }
+
+        void Wall(GameObject parent, Vector3 pos, Vector3 scale)
+        {
+            var w = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            w.transform.SetParent(parent.transform);
+            w.transform.position = pos;
+            w.transform.localScale = scale;
+        }
+
+        void CreateLighting()
+        {
+            var root = new GameObject("Generated_Lighting");
+            var moon = new GameObject("Moonlight");
+            moon.transform.SetParent(root.transform);
+            var l = moon.AddComponent<Light>();
+            l.type = LightType.Directional;
+            l.intensity = 0.15f;
+            l.color = new Color(0.4f, 0.45f, 0.6f);
+            l.shadows = LightShadows.Soft;
+            moon.transform.rotation = Quaternion.Euler(15f, -45f, 0f);
+
+            RenderSettings.fog = true;
+            RenderSettings.fogMode = FogMode.ExponentialSquared;
+            RenderSettings.fogDensity = 0.03f;
+            RenderSettings.fogColor = new Color(0.02f, 0.02f, 0.03f);
+        }
+
+        void CreateBodyCamVolume()
+        {
+            var go = new GameObject("Generated_BodyCam");
+            go.AddComponent<BodyCamController>();
+            if (bodyCamConfig != null)
+            {
+                var so = new UnityEditor.SerializedObject(go.GetComponent<BodyCamController>());
+                so.FindProperty("config").objectReferenceValue = bodyCamConfig;
+                so.ApplyModifiedProperties();
+            }
+        }
+
+        void CreatePlayer()
+        {
+            var root = new GameObject("Generated_Player");
+            var sp = root.AddComponent<PlayerSpawner>();
+            var so = new UnityEditor.SerializedObject(sp);
+            so.FindProperty("playerPrefab").objectReferenceValue = playerPrefab;
+            so.ApplyModifiedProperties();
+        }
+
+        void CreateWeaponPickups()
+        {
+            var root = new GameObject("Generated_Pickups");
+            SpawnPickup(root, WeaponType.Rifle, rifleData, riflePrefab, new Vector3(-3f, 0.5f, -18f));
+            SpawnPickup(root, WeaponType.Shotgun, shotgunData, shotgunPrefab, new Vector3(0f, 0.5f, -15f));
+        }
+
+        void SpawnPickup(GameObject parent, WeaponType type, WeaponDataSO data, GameObject prefab, Vector3 pos)
+        {
+            var go = new GameObject($"{type}_Pickup");
+            go.transform.SetParent(parent.transform);
+            go.transform.position = pos;
+            var cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            cube.transform.SetParent(go.transform);
+            cube.transform.localScale = new Vector3(0.3f, 0.15f, 1f);
+            DestroyImmediate(cube.GetComponent<Collider>());
+
+            var pickup = go.AddComponent<WeaponPickup>();
+            var so = new UnityEditor.SerializedObject(pickup);
+            so.FindProperty("type").enumValueIndex = (int)type;
+            so.FindProperty("data").objectReferenceValue = data;
+            so.FindProperty("weaponPrefab").objectReferenceValue = prefab;
+            so.FindProperty("displayName").stringValue = data != null ? data.displayName : type.ToString();
+            so.ApplyModifiedProperties();
+        }
+
+        void CreateTargets()
+        {
+            var root = new GameObject("Generated_Targets");
+            SpawnTarget(root, new Vector3(-5f, 1.5f, -10f));
+            SpawnTarget(root, new Vector3(0f, 1.5f, 15f));
+            SpawnTarget(root, new Vector3(8f, 1.5f, 30f));
+        }
+
+        void SpawnTarget(GameObject parent, Vector3 pos)
+        {
+            var root = new GameObject("Target");
+            root.transform.SetParent(parent.transform);
+            root.transform.position = pos;
+
+            // Body
+            var body = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            body.transform.SetParent(root.transform);
+            body.transform.localScale = new Vector3(0.8f, 1.4f, 0.3f);
+            body.transform.localPosition = new Vector3(0f, 0.2f, 0f);
+            body.AddComponent<HitZone>().Multiplier = 1f;
+
+            // Head
+            var head = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            head.transform.SetParent(root.transform);
+            head.transform.localScale = Vector3.one * 0.4f;
+            head.transform.localPosition = new Vector3(0f, 1.2f, 0f);
+            head.AddComponent<HitZone>().Multiplier = 3f;
+            head.GetComponent<HitZone>().ZoneType = Core.HitZoneType.Head;
+
+            var hc = root.AddComponent<HealthComponent>();
+            var so = new UnityEditor.SerializedObject(hc);
+            so.FindProperty("maxHealth").floatValue = 50f;
+            so.FindProperty("destroyOnDeath").boolValue = true;
+            so.FindProperty("destroyDelay").floatValue = 2f;
+            so.ApplyModifiedProperties();
+
+            root.AddComponent<TestTarget>();
+        }
+    }
+}
+```
+
+---
+
+## 📋 Инструкция агенту (пошагово)
+
+### Шаг 1 — Создать файлы
+Все 22 файла по дереву выше. Порядок неважен.
+
+### Шаг 2 — Проверить компиляцию
+Ожидаемо: могут быть unused using в паре мест — игнорировать.
+
+### Шаг 3 — Создать ассеты
+
+| Ассет | Значения |
+|---|---|
+| **Weapon_Rifle.asset** | type=Rifle, isAutomatic=true, fireRate=0.12, pellets=1, damagePerPellet=25, spread=0.3, spreadPerShot=0.25, maxSpread=3, falloff 30/80/0.4, recoil V=1.2 H=0.3, mag=30, reload=2.5, shellByShell=false, hip=(0.22,-0.22,0.4), ads=(0,-0.14,0.3), hipFov=65, adsFov=48 |
+| **Weapon_Shotgun.asset** | type=Shotgun, isAutomatic=false, fireRate=0.8, **pellets=8, damagePerPellet=10**, spread=5, spreadPerShot=1.5, maxSpread=12, falloff 8/25/0.15, recoil V=5 H=1, mag=8, reload=3.0, **shellByShell=true, shellReloadTime=0.5**, hip=(0.3,-0.3,0.5), ads=(0,-0.18,0.4), hipFov=65, adsFov=52 |
+| **BodyCam_Default.asset** | дефолты из BodyCamConfigSO |
+
+**Критично:** дробовик **damagePerPellet=10 × pellets=8 = 80 урона** — мишень 50HP умирает с 1 выстрела в упор.
+
+### Шаг 4 — Создать префабы оружия
+
+`Rifle.prefab` / `Shotgun.prefab`:
+```
+Root (WeaponRuntime + WeaponSway)
+├── Visual (2-3 куба — приклад, ствол, цевьё)
+└── MuzzlePoint (empty, впереди)
+```
+- `WeaponRuntime.data` = соответствующий SO
+- `WeaponRuntime.muzzlePoint` = MuzzlePoint
+- `WeaponRuntime.aimPivot` = ссылка на игровой AimPivot
+- `WeaponRuntime.recoil` = RecoilController
+- `WeaponRuntime.muzzleFlashPrefab` = префаб с MuzzleFlash + MuzzleFlashLight
+- `WeaponRuntime.tracerPrefab` = LineRenderer с TracerLine
+
+### Шаг 5 — Создать MuzzleFlash префаб
+
+```
+MuzzleFlash (MuzzleFlash + MuzzleFlashLight + Point Light)
+├── ParticleSystem (небольшой, lifetime 0.1)
+```
+
+### Шаг 6 — Создать Tracer префаб
+
+```
+Tracer (LineRenderer + TracerLine)
+LineRenderer: positions=2, width=0.02, материал (unlit жёлтый)
+```
+
+### Шаг 7 — Создать префаб игрока `BodycamPlayer.prefab`
+
+```
+BodycamPlayer (CharacterController, PlayerMotor, BodyFollower, PlayerInteractor)
+│  CharacterController: Height=1.8, Radius=0.3, Center=(0,0.9,0)
+│  PlayerMotor.cameraTransform = Camera
+│  PlayerInteractor.rayOrigin = AimPivot
+│
+├── AimPivot (AimPivot)
+│   │
+│   ├── WeaponHolder (WeaponController, ADSController)
+│   │   │  WeaponController.weaponHolder = это
+│   │   │  WeaponController.aimPivotTransform = AimPivot
+│   │   │  ADSController.camera = Camera
+│   │   │  ADSController.aimPivot = AimPivot
+│   │   │
+│   │   └── (оружие инстанциируется сюда)
+│   │
+│   └── Flashlight (Light + Flashlight)
+│       Light: type=Spot, angle=45, range=50
+│
+├── CameraContainer (CameraEffects.cameraContainer = это)
+│   └── Camera (Camera, CameraFollower, RecoilController)
+│       │  CameraFollower.aimPivot = AimPivot
+│       │  RecoilController.aimPivot = AimPivot
+│       │  CameraEffects.motor = PlayerMotor
+│       │
+│       └── (сюда указывают WeaponRuntime.recoil)
+│
+└── HealthComponent
+```
+
+**Критично:**
+- **AimPivot и Camera — разные ветки**, не родитель-ребёнок
+- **AimPivot НЕ содержит камеру**
+- **WeaponHolder — дочерний AimPivot** (оружие с AimPivot)
+- **Flashlight — дочерний AimPivot** (светит туда же, куда ствол)
+- **CameraContainer — дочерний Player** (bob отдельно от прицела)
+
+### Шаг 8 — Сцена
+
+- `SceneBuilder` объект с `HorrorSceneBuilder`, все ссылки назначены
+- `InputProvider` singleton на сцене
+- ПКМ по `HorrorSceneBuilder` → **Generate Scene**
+- Убедиться, что тег `Ground` существует
+
+### Шаг 9 — Play Mode верификация
+
+```
+[ ] Console чистая
+[ ] WASD двигает, Space прыгает
+[ ] Мышь → оружие СНАЧАЛА двигается, камера догоняет (deadzone работает)
+[ ] Водишь мышью в пределах ±10° → оружие ходит, камера стоит
+[ ] Вышел за 10° → камера догоняет
+[ ] F → фонарик вкл/выкл, светит туда же, куда ствол
+[ ] B → bodycam эффекты toggle
+[ ] Подхожу к ружью → E → подбираю
+[ ] ЛКМ → выстрел, вспышка ОСВЕЩАЕТ комнату (muzzle light)
+[ ] Мишень 50HP: 2 выстрела ружья (25×2=50) → умирает
+[ ] Попадание в HEAD → insta-kill (25×3=75>50)
+[ ] Подбираю дробовик → 2 → переключение
+[ ] ЛКМ в упор → мишень умирает С ОДНОГО (10×8=80)
+[ ] Дробовик: R → reload shell-by-shell (по 1 патрону за 0.5с)
+[ ] Дробовик: R → ЛКМ прерывает перезарядку
+[ ] Отдача: выстрел ружья → ствол ПОДБРАСЫВАЕТСЯ ВВЕРХ
+[ ] Можно компенсировать мышью вниз
+[ ] G → дроп, можно подобрать E
+[ ] Трассер летит ИЗ СТВОЛА (не из центра экрана)
+```
+
+---
+
+## 🎯 Что изменилось от v1 (почему это Bodycam, а не generic FPS)
+
+| Механика | v1 (ошибочно) | v2 (Bodycam-стиль) |
+|---|---|---|
+| **Мышь вращает** | Камеру | **AimPivot** (оружие/фонарик) |
+| **Камера** | Master | **Slave**, следует с deadzone |
+| **Источник raycast** | `camera.ViewportPointToRay(0.5,0.5)` | **`muzzlePoint.position` + `aimPivot.forward`** |
+| **Стрельба в цель** | Центр экрана | **Куда смотрит ствол** |
+| **Отдача** | Только визуал | **AimPivot подбрасывается вверх** (компенсируется мышью) |
+| **Фонарик** | Дочерний камеры | **Дочерний AimPivot** (светит со стволом) |
+| **Движение** | От камеры | От камеры (камера показывает "куда идти") |
+| **Тело** | Вращается с камерой | **Догоняет AimPivot** с задержкой |
+
+Это ключевые отличия, которые дают «bodycam-ощущение» вместо стандартного FPS.
+
+---
+
+## ✅ Что закрыто из аудита
+
+| Баг из аудита | Как решено |
+|---|---|
+| E не подбирает | `PlayerInteractor.OnEnable` подписка на `InputProvider.InteractPressed` |
+| Дробовик 10 урона | `damagePerPellet=10 × pellets=8 = 80` в SO |
+| Фонарик 20 сек | `useBattery=false` по умолчанию (`InfiniteBattery`) |
+| Деревья без коллайдеров | `CreatePrimitive(Cylinder)` даёт коллайдер |
+| Нет hit zones | `HitZone` компонент на дочерних коллайдерах |
+| Нет falloff | `WeaponDataSO.ComputeFalloff(distance)` |
+| Recoil не влияет на aim | `RecoilController.ApplyRecoil` → `AimPivot._recoilOffset` |
+| Нет muzzle light | `MuzzleFlashLight` (point light 0.05с) |
+| Дробовик не shell-by-shell | `ShellReloadRoutine` с `_input.FireHeld` прерыванием |
+| Raycast из камеры | Raycast из `muzzlePoint.position` вдоль `aimPivot.forward` |
+| Камера master | **AimPivot master**, камера slave с deadzone |
+| Нет респавна | `PlayerSpawner` + `HealthComponent.OnDeath` |
+
+Передавайте этот документ агенту — он должен создать файлы, ассеты, префабы, нажать `Generate Scene` и прогнать чек-лист. Всё, что нужно для **рабочего Bodycam-прототипа** — здесь.

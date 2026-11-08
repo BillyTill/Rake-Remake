@@ -1,0 +1,1 @@
+{"query": "objects | where name == 'BodycamTest_Player' | recurse children max-depth=3 | select name active $ref components.$type transform.position"}

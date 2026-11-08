@@ -1,0 +1,1 @@
+namespace Lake.Weapons { public enum WeaponType { Rifle = 0, Shotgun = 1 } }

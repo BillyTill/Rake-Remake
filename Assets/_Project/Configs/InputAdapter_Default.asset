@@ -1,0 +1,7 @@
+fileFormatVersion: 2
+guid: 4d5a0c6b7e8f9a0b1c2d3e4f5a6b7c8d
+InputAdapterConfig:
+  m_ObjectHideFlags: 0
+  m_Script: {fileID: 11500000, guid: ff1658bc0d437604dad338d237f197a9, type: 3}
+  enableNewInput: 0
+  logInputEvents: 0

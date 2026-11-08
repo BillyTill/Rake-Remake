@@ -1,0 +1,1 @@
+{"query": "editor | call ExecuteMenuItem('Tools/Lake/Build Player Rig')"}

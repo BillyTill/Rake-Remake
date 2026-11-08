@@ -1,0 +1,1 @@
+{"query": "editor | call CreateAsset('Lake.Bodycam.Config.WeaponLookConfig', 'Assets/_Project/Configs/WeaponLook_Default.asset')"}

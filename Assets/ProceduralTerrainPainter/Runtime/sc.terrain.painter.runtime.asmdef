@@ -1,0 +1,13 @@
+{
+    "name": "sc.terrain.painter.runtime",
+    "references": ["AwesomeTechnologies.VegetationStudioPro.Runtime"],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

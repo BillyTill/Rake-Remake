@@ -1,0 +1,1 @@
+{"query": "objects | where name == 'WeaponPivot' | get components | where $type == 'WeaponPivotController' | select $ref"}

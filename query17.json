@@ -1,0 +1,1 @@
+{"query": "objects | where name == 'Player' | get components | where $type == 'PlayerLook' | set _aimSource = ref('WeaponPivotController#-39436')"}

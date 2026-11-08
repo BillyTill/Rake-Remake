@@ -1,0 +1,1233 @@
+Роль: Ты — senior Unity-разработчик, работающий через Unity MCP. Проект — HDRP 17.0.1, Unity 6. Прототип Bodycam-хоррора уже реализован, включая:
+
+InputProvider (singleton, все события ввода)
+
+AimPivot (мышь вращает прицел, камера следует с deadzone)
+
+WeaponController + WeaponRuntime (raycast из muzzle, split recoil, hit zones)
+
+Flashlight (стратегия батареи, flicker)
+
+HealthComponent (IDamageable)
+
+PlayerSpawner (респавн)
+
+BodyCamController (HDRP Volume)
+
+HorrorSceneBuilder (runtime-генерация сцены)
+
+Задача: Реализовать полный пользовательский интерфейс в стиле bodycam-камеры с:
+
+Динамическим прицелом
+
+Подсказкой взаимодействия + обводкой интерактивных предметов
+
+Панелью патронов и слотов оружия
+
+Индикатором фонарика с батареей
+
+Полосой здоровья
+
+Оверлеем бодикама (REC, таймкод, ID камеры)
+
+Панелью подсказок клавиш
+
+Экраном смерти + респавном
+
+Стиль: утилитарный, «сырой», как настоящий police bodycam. Моноширинный шрифт, зеленоватый/белый текст, мигающая красная точка REC, таймкод с миллисекундами.
+
+📋 Требования
+Часть 1 — Модификации существующих скриптов
+Агент обязан добавить публичные события в существующие компоненты (без изменения их логики):
+
+Файл	Что добавить
+PlayerInteractor.cs	public event Action<IInteractable, string> OnTargetChanged; — вызывать в Update() при смене _current. OnTargetChanged?.Invoke(_current, _current?.Prompt) при null — (null, null).
+WeaponController.cs	public event Action<int, WeaponRuntime> OnSlotChanged; — вызывать в SwitchTo. public WeaponRuntime[] AllWeapons => _runtimes;
+WeaponRuntime.cs	Пробросить событие OnAmmoChanged наружу (уже есть). Добавить public bool IsAds { get; private set; } (уже есть _isAds — сделать публичным).
+Flashlight.cs	public event Action<bool> OnToggled; — вызывать в SetOn(). public event Action<float> OnBatteryChanged; — вызывать в Update() при изменении (раз в 0.2с). public bool IsOn => _isOn; public IBatteryStrategy CurrentBattery => Battery;
+BodyCamController.cs	public event Action<bool> OnToggled; — вызывать в Toggle(). public bool IsActive => enabled_;
+PlayerSpawner.cs	public event Action<GameObject> OnPlayerSpawned; — в Spawn(). public event Action OnPlayerDied; — при подписке на HealthComponent.OnDeath, перед респавном.
+HealthComponent.cs	Уже есть OnHealthChanged — использовать.
+Правило: не переписывать логику существующих скриптов, только добавлять события и геттеры.
+
+Часть 2 — Новые скрипты
+Создать файлы в Assets/_Project/Scripts/UI/ и Assets/_Project/Scripts/Outline/.
+
+📁 UI/HudController.cs — Оркестратор
+csharp
+using UnityEngine;
+using Lake.Player;
+using Lake.Weapons;
+using Lake.Flashlight;
+using Lake.Health;
+using Lake.BodyCam;
+using Lake.Outline;
+
+namespace Lake.UI
+{
+    /// <summary>
+    /// Собирает ссылки на все UI-компоненты и связывает их событиями.
+    /// Не содержит логики — только маршрутизация.
+    /// </summary>
+    public class HudController : MonoBehaviour
+    {
+        [SerializeField] CrosshairUI crosshair;
+        [SerializeField] InteractionPromptUI prompt;
+        [SerializeField] AmmoPanelUI ammo;
+        [SerializeField] WeaponSlotsUI slots;
+        [SerializeField] FlashlightUI flashlight;
+        [SerializeField] HealthBarUI health;
+        [SerializeField] BodyCamOverlayUI overlay;
+        [SerializeField] KeyHintsUI keyHints;
+        [SerializeField] DeathScreenUI deathScreen;
+        [SerializeField] OutlineManager outlineManager;
+
+        PlayerInteractor _interactor;
+        WeaponController _weapons;
+        Flashlight.Flashlight _flashlight;
+        HealthComponent _health;
+        BodyCamController _bodycam;
+        PlayerSpawner _spawner;
+
+        public void Bind(PlayerInteractor interactor, WeaponController weapons,
+                         Flashlight.Flashlight fl, HealthComponent hp,
+                         BodyCamController bc, PlayerSpawner spawner)
+        {
+            _interactor = interactor;
+            _weapons = weapons;
+            _flashlight = fl;
+            _health = hp;
+            _bodycam = bc;
+            _spawner = spawner;
+
+            // Interaction
+            if (_interactor != null)
+                _interactor.OnTargetChanged += OnTargetChanged;
+
+            // Weapons
+            if (_weapons != null)
+            {
+                _weapons.OnSlotChanged += OnSlotChanged;
+                _weapons.OnSlotChanged += (slot, w) =>
+                {
+                    if (w != null) w.OnAmmoChanged += (cur, res) => ammo.SetAmmo(cur, res, w.Data);
+                };
+                // Начальный пуш
+                for (int i = 0; i < 2; i++)
+                    slots.SetSlotOccupied(i, _weapons.AllWeapons[i] != null);
+            }
+
+            // Flashlight
+            if (_flashlight != null)
+            {
+                _flashlight.OnToggled += on => flashlight.SetState(on);
+                _flashlight.OnBatteryChanged += lvl => flashlight.SetBattery(lvl);
+                flashlight.SetState(_flashlight.IsOn);
+            }
+
+            // Health
+            if (_health != null)
+            {
+                _health.OnHealthChanged += (cur, max) => health.SetHealth(cur, max);
+                health.SetHealth(100, 100);
+            }
+
+            // Bodycam
+            if (_bodycam != null)
+            {
+                _bodycam.OnToggled += on => overlay.SetBodycamActive(on);
+                overlay.SetBodycamActive(_bodycam.IsActive);
+            }
+
+            // Death
+            if (_spawner != null)
+            {
+                _spawner.OnPlayerDied += OnPlayerDied;
+                _spawner.OnPlayerSpawned += OnPlayerSpawned;
+            }
+        }
+
+        void OnTargetChanged(IInteractable target, string promptText)
+        {
+            prompt.SetTarget(target, promptText);
+            outlineManager.SetTarget(target as Component);
+        }
+
+        void OnSlotChanged(int slot, WeaponRuntime weapon)
+        {
+            slots.SetActiveSlot(weapon != null ? slot : -1);
+            crosshair.SetVisible(weapon != null);
+            if (weapon != null) ammo.SetAmmo(weapon.CurrentAmmo, weapon.ReserveAmmo, weapon.Data);
+        }
+
+        void OnPlayerDied()
+        {
+            deathScreen.Show(2f);
+            crosshair.SetVisible(false);
+            prompt.SetTarget(null, null);
+            outlineManager.SetTarget(null);
+        }
+
+        void OnPlayerSpawned(GameObject player)
+        {
+            deathScreen.Hide();
+        }
+
+        void Update()
+        {
+            // Пульсация crosshair на основе spread текущего оружия
+            if (_weapons != null && _weapons.Current != null)
+                crosshair.SetSpread(_weapons.Current.Data.baseSpread);
+        }
+    }
+}
+📁 UI/CrosshairUI.cs
+csharp
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro;
+
+namespace Lake.UI
+{
+    public class CrosshairUI : MonoBehaviour
+    {
+        [SerializeField] RectTransform top, bottom, left, right;
+        [SerializeField] Image dot;
+        [SerializeField] float baseGap = 6f;
+        [SerializeField] float gapPerDegree = 2f;
+
+        public void SetVisible(bool v)
+        {
+            gameObject.SetActive(v);
+        }
+
+        public void SetSpread(float spreadDegrees)
+        {
+            float gap = baseGap + spreadDegrees * gapPerDegree;
+            if (top != null) top.anchoredPosition = new Vector2(0, gap);
+            if (bottom != null) bottom.anchoredPosition = new Vector2(0, -gap);
+            if (left != null) left.anchoredPosition = new Vector2(-gap, 0);
+            if (right != null) right.anchoredPosition = new Vector2(gap, 0);
+        }
+    }
+}
+Layout: 4 линии (1×8px) по центру + 2×2px точка. Цвет: белый с 70% alpha. При deadzone — всегда в центре экрана (не следует за AimPivot — это crosshair игрока, а не оружия).
+
+📁 UI/InteractionPromptUI.cs
+csharp
+using UnityEngine;
+using TMPro;
+using Lake.Core;
+
+namespace Lake.UI
+{
+    public class InteractionPromptUI : MonoBehaviour
+    {
+        [SerializeField] CanvasGroup group;
+        [SerializeField] TMP_Text label;
+        [SerializeField] string keyLabel = "E";
+        [SerializeField] float fadeSpeed = 8f;
+
+        IInteractable _current;
+        float _alpha;
+
+        public void SetTarget(IInteractable target, string promptText)
+        {
+            _current = target;
+            if (target != null && !string.IsNullOrEmpty(promptText))
+                label.text = $"[<color=#FFD54F>{keyLabel}</color>] {promptText}";
+        }
+
+        void Update()
+        {
+            float target = _current != null ? 1f : 0f;
+            _alpha = Mathf.MoveTowards(_alpha, target, Time.deltaTime * fadeSpeed);
+            group.alpha = _alpha;
+        }
+    }
+}
+Layout: Bottom-center, отступ 120px от низа. Шрифт 22pt, чёрная обводка.
+
+📁 UI/AmmoPanelUI.cs
+csharp
+using UnityEngine;
+using TMPro;
+using Lake.Weapons;
+
+namespace Lake.UI
+{
+    public class AmmoPanelUI : MonoBehaviour
+    {
+        [SerializeField] TMP_Text current;
+        [SerializeField] TMP_Text reserve;
+        [SerializeField] TMP_Text weaponName;
+
+        public void SetAmmo(int cur, int res, WeaponDataSO data)
+        {
+            current.text = cur.ToString("D2");
+            reserve.text = res.ToString("D3");
+            if (data != null) weaponName.text = data.displayName.ToUpper();
+
+            current.color = cur == 0 ? Color.red :
+                            cur <= data.magazineSize * 0.25f ? new Color(1f, 0.6f, 0.2f) :
+                            Color.white;
+        }
+    }
+}
+Layout: Bottom-right, 40px от края. Текущий патрон — 48pt bold, резерв — 24pt серый. Имя оружия — 14pt над патронами.
+
+📁 UI/WeaponSlotsUI.cs
+csharp
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro;
+
+namespace Lake.UI
+{
+    public class WeaponSlotsUI : MonoBehaviour
+    {
+        [System.Serializable]
+        public class Slot
+        {
+            public Image background;
+            public TMP_Text label;
+            public TMP_Text keyLabel;
+        }
+
+        [SerializeField] Slot[] slots = new Slot[2];
+        [SerializeField] Color activeColor = new(1f, 0.85f, 0.3f, 0.9f);
+        [SerializeField] Color occupiedColor = new(1f, 1f, 1f, 0.4f);
+        [SerializeField] Color emptyColor = new(1f, 1f, 1f, 0.1f);
+
+        public void SetSlotOccupied(int index, bool occupied)
+        {
+            if (index < 0 || index >= slots.Length) return;
+            slots[index].background.color = occupied ? occupiedColor : emptyColor;
+            slots[index].label.color = occupied ? Color.white : new Color(1, 1, 1, 0.3f);
+        }
+
+        public void SetActiveSlot(int index)
+        {
+            for (int i = 0; i < slots.Length; i++)
+            {
+                bool active = i == index;
+                slots[i].background.color = active ? activeColor :
+                                            slots[i].background.color.a > 0.05f ? occupiedColor : emptyColor;
+                slots[i].background.rectTransform.localScale = active ? Vector3.one * 1.1f : Vector3.one;
+            }
+        }
+    }
+}
+Layout: Bottom-right, выше панели патронов. Два квадрата 60×60px, между ними 8px. В каждом: [1] RIFLE / [2] SHOTGUN.
+
+📁 UI/FlashlightUI.cs
+csharp
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro;
+
+namespace Lake.UI
+{
+    public class FlashlightUI : MonoBehaviour
+    {
+        [SerializeField] Image icon;
+        [SerializeField] TMP_Text status;
+        [SerializeField] Image batteryFill;
+        [SerializeField] Color onColor = new(1f, 0.9f, 0.4f, 1f);
+        [SerializeField] Color offColor = new(1f, 1f, 1f, 0.3f);
+
+        public void SetState(bool on)
+        {
+            status.text = on ? "FLASHLIGHT ON" : "FLASHLIGHT OFF";
+            status.color = on ? onColor : offColor;
+            icon.color = on ? onColor : offColor;
+        }
+
+        public void SetBattery(float level01)
+        {
+            batteryFill.fillAmount = level01;
+            batteryFill.color = level01 > 0.2f ? onColor : new Color(1f, 0.3f, 0.2f);
+        }
+    }
+}
+Layout: Bottom-left. Иконка + текст. Под ней — тонкая полоса батареи 100×6px.
+
+📁 UI/HealthBarUI.cs
+csharp
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro;
+
+namespace Lake.UI
+{
+    public class HealthBarUI : MonoBehaviour
+    {
+        [SerializeField] Image fill;
+        [SerializeField] TMP_Text valueLabel;
+
+        public void SetHealth(float current, float max)
+        {
+            float pct = max > 0 ? current / max : 0f;
+            fill.fillAmount = pct;
+            fill.color = Color.Lerp(new Color(0.8f, 0.1f, 0.1f), new Color(0.2f, 0.9f, 0.3f), pct);
+            valueLabel.text = $"{Mathf.CeilToInt(current)} / {Mathf.CeilToInt(max)}";
+        }
+    }
+}
+Layout: Bottom-left, над фонариком. Полоса 220×14px, текст внутри.
+
+📁 UI/BodyCamOverlayUI.cs
+csharp
+using UnityEngine;
+using TMPro;
+
+namespace Lake.UI
+{
+    public class BodyCamOverlayUI : MonoBehaviour
+    {
+        [SerializeField] CanvasGroup group;
+        [SerializeField] TMP_Text recLabel;
+        [SerializeField] TMP_Text timecodeLabel;
+        [SerializeField] TMP_Text dateLabel;
+        [SerializeField] TMP_Text camIdLabel;
+        [SerializeField] TMP_Text batteryLabel;
+        [SerializeField] float recBlinkHz = 1.5f;
+
+        bool _active;
+        float _t;
+
+        void Start()
+        {
+            camIdLabel.text = "CAM-01  //  PATROL";
+            dateLabel.text = System.DateTime.Now.ToString("yyyy-MM-dd");
+        }
+
+        public void SetBodycamActive(bool v)
+        {
+            _active = v;
+            group.alpha = v ? 1f : 0f;
+        }
+
+        void Update()
+        {
+            if (!_active) return;
+            _t += Time.deltaTime;
+
+            // REC мигает
+            float blink = Mathf.Sin(_t * recBlinkHz * Mathf.PI * 2f);
+            recLabel.color = new Color(1f, 0.1f, 0.1f, blink > 0 ? 1f : 0.2f);
+
+            // Timecode HH:MM:SS:FF (FF = кадры @ 30fps)
+            int totalSec = Mathf.FloorToInt(Time.time);
+            int frames = Mathf.FloorToInt((Time.time - totalSec) * 30f) % 30;
+            timecodeLabel.text = $"{totalSec / 3600:D2}:{(totalSec / 60) % 60:D2}:{totalSec % 60:D2}:{frames:D2}";
+
+            batteryLabel.text = $"{Mathf.CeilToInt(SystemInfo.batteryLevel * 100f)}%";
+        }
+    }
+}
+Layout:
+
+Top-left: ● REC (красный мигающий) + 00:12:34:15 под ним (20pt monospace)
+
+Top-right: CAM-01 // PATROL + дата + батарея
+
+Bottom-center (уже опционально): timestamp кадра
+
+📁 UI/KeyHintsUI.cs
+csharp
+using UnityEngine;
+using TMPro;
+using Lake.Core;
+
+namespace Lake.UI
+{
+    public class KeyHintsUI : MonoBehaviour
+    {
+        [SerializeField] CanvasGroup group;
+        [SerializeField] TMP_Text label;
+        [SerializeField] float fadeSpeed = 10f;
+
+        bool _visible = true;
+
+        void Start()
+        {
+            label.text =
+                "<color=#FFD54F>WASD</color> Move   " +
+                "<color=#FFD54F>SHIFT</color> Sprint   " +
+                "<color=#FFD54F>CTRL</color> Crouch\n" +
+                "<color=#FFD54F>E</color> Interact   " +
+                "<color=#FFD54F>F</color> Flashlight   " +
+                "<color=#FFD54F>B</color> Bodycam\n" +
+                "<color=#FFD54F>1/2</color> Weapon   " +
+                "<color=#FFD54F>LMB</color> Fire   " +
+                "<color=#FFD54F>RMB</color> Aim   " +
+                "<color=#FFD54F>R</color> Reload   " +
+                "<color=#FFD54F>G</color> Drop\n" +
+                "<color=#FFD54F>TAB</color> Toggle hints";
+
+            if (InputProvider.Instance != null)
+                InputProvider.Instance.OnTabPressed += Toggle;
+        }
+
+        void OnDestroy()
+        {
+            if (InputProvider.Instance != null)
+                InputProvider.Instance.OnTabPressed -= Toggle;
+        }
+
+        void Toggle() => _visible = !_visible;
+
+        void Update()
+        {
+            group.alpha = Mathf.MoveTowards(group.alpha, _visible ? 0.85f : 0f, Time.deltaTime * fadeSpeed);
+        }
+    }
+}
+Требует: добавить в InputProvider.cs — public event Action OnTabPressed; + if (Input.GetKeyDown(KeyCode.Tab)) OnTabPressed?.Invoke();
+
+Layout: Top-center или top-right, 12pt, моноширинный, полупрозрачная панель.
+
+📁 UI/DeathScreenUI.cs
+csharp
+using System.Collections;
+using UnityEngine;
+using TMPro;
+
+namespace Lake.UI
+{
+    public class DeathScreenUI : MonoBehaviour
+    {
+        [SerializeField] CanvasGroup group;
+        [SerializeField] TMP_Text title;
+        [SerializeField] TMP_Text countdown;
+
+        Coroutine _routine;
+
+        public void Show(float respawnDelay)
+        {
+            gameObject.SetActive(true);
+            if (_routine != null) StopCoroutine(_routine);
+            _routine = StartCoroutine(ShowRoutine(respawnDelay));
+        }
+
+        IEnumerator ShowRoutine(float delay)
+        {
+            title.text = "SIGNAL LOST";
+            float t = 0;
+            group.alpha = 0;
+            while (t < 1f) { t += Time.deltaTime * 2f; group.alpha = t; yield return null; }
+
+            t = delay;
+            while (t > 0)
+            {
+                countdown.text = $"RECONNECTING... {Mathf.CeilToInt(t)}";
+                t -= Time.deltaTime;
+                yield return null;
+            }
+        }
+
+        public void Hide()
+        {
+            if (_routine != null) StopCoroutine(_routine);
+            gameObject.SetActive(false);
+        }
+    }
+}
+Layout: Fullscreen чёрный фон (alpha 0.9), по центру SIGNAL LOST 72pt красным + под ним countdown.
+
+Часть 3 — Система обводки (Outline)
+📁 Outline/Highlightable.cs
+csharp
+using UnityEngine;
+
+namespace Lake.Outline
+{
+    /// <summary>
+    /// Маркер: этот объект может быть подсвечен OutlineManager.
+    /// Добавляется на корень pickup'а, мишени или любого интерактивного объекта.
+    /// </summary>
+    public class Highlightable : MonoBehaviour
+    {
+        public Color HighlightColor = new(1f, 0.85f, 0.2f, 1f);
+        public float ScaleMultiplier = 1.06f;
+    }
+}
+📁 Outline/OutlineManager.cs
+csharp
+using UnityEngine;
+using Lake.Weapons;
+
+namespace Lake.Outline
+{
+    /// <summary>
+    /// Управляет обводкой. Одновременно подсвечен только один объект.
+    /// </summary>
+    public class OutlineManager : MonoBehaviour
+    {
+        OutlineRenderer _current;
+
+        public void SetTarget(Component component)
+        {
+            Highlightable target = null;
+            if (component != null)
+            {
+                target = component.GetComponentInParent<Highlightable>();
+                // Если IInteractable — на этом компоненте, а Highlightable — на родителе
+                if (target == null) target = component.GetComponent<Highlightable>();
+            }
+
+            if (_current != null && (_current.Target != target))
+            {
+                _current.Dispose();
+                _current = null;
+            }
+
+            if (target != null && _current == null)
+            {
+                _current = new OutlineRenderer(target);
+                _current.Create();
+            }
+        }
+
+        void OnDestroy() { _current?.Dispose(); }
+    }
+}
+📁 Outline/OutlineRenderer.cs
+csharp
+using UnityEngine;
+using UnityEngine.Rendering;
+
+namespace Lake.Outline
+{
+    /// <summary>
+    /// Создаёт дубликат меша с увеличенным масштабом и unlit-материалом.
+    /// Cull Front даёт эффект обводки (видна только "изнаночная" часть).
+    /// Если HDRP/Unlit не поддерживает cull front через _CullMode — 
+    /// дубликат рендерится как сплошное свечение вокруг объекта (приемлемо).
+    /// </summary>
+    public class OutlineRenderer : System.IDisposable
+    {
+        public Highlightable Target { get; }
+        GameObject _clone;
+        Renderer[] _originalRenderers;
+        Material _outlineMat;
+
+        public OutlineRenderer(Highlightable target) { Target = target; }
+
+        public void Create()
+        {
+            _originalRenderers = Target.GetComponentsInChildren<Renderer>();
+            if (_originalRenderers.Length == 0) { Debug.LogWarning("[Outline] No renderer found"); return; }
+
+            Shader shader = Shader.Find("HDRP/Unlit");
+            if (shader == null) shader = Shader.Find("Unlit/Color");
+            if (shader == null) { Debug.LogError("[Outline] No unlit shader found"); return; }
+
+            _outlineMat = new Material(shader);
+            Color c = Target.HighlightColor;
+            // HDRP/Unlit
+            if (_outlineMat.HasProperty("_UnlitColor")) _outlineMat.SetColor("_UnlitColor", c);
+            if (_outlineMat.HasProperty("_UnlitColorMap")) _outlineMat.SetColor("_UnlitColorMap", c);
+            if (_outlineMat.HasProperty("_BaseColor")) _outlineMat.SetColor("_BaseColor", c);
+            if (_outlineMat.HasProperty("_Color")) _outlineMat.SetColor("_Color", c);
+
+            // Cull front — инвертированные нормали
+            if (_outlineMat.HasProperty("_CullMode")) _outlineMat.SetFloat("_CullMode", 1f);
+            if (_outlineMat.HasProperty("_CullModeForward")) _outlineMat.SetFloat("_CullModeForward", 1f);
+            if (_outlineMat.HasProperty("_DoubleSidedEnable")) _outlineMat.SetFloat("_DoubleSidedEnable", 1f);
+
+            _outlineMat.renderQueue = 3000; // Transparent
+
+            _clone = new GameObject($"[Outline] {Target.name}");
+            _clone.transform.SetParent(Target.transform.parent);
+            _clone.transform.position = Target.transform.position;
+            _clone.transform.rotation = Target.transform.rotation;
+            _clone.transform.localScale = Target.transform.localScale;
+
+            // Копируем только меши (без коллайдеров и других компонентов)
+            foreach (var r in _originalRenderers)
+            {
+                if (r is MeshRenderer mr && mr.TryGetComponent<MeshFilter>(out var mf))
+                {
+                    var child = new GameObject("outline_mesh");
+                    child.transform.SetParent(_clone.transform);
+                    child.transform.position = mr.transform.position;
+                    child.transform.rotation = mr.transform.rotation;
+                    child.transform.localScale = mr.transform.localScale * Target.ScaleMultiplier;
+                    var nMF = child.AddComponent<MeshFilter>();
+                    nMF.sharedMesh = mf.sharedMesh;
+                    var nMR = child.AddComponent<MeshRenderer>();
+                    nMR.sharedMaterial = _outlineMat;
+                    nMR.shadowCastingMode = ShadowCastingMode.Off;
+                    nMR.receiveShadows = false;
+                }
+                else if (r is SkinnedMeshRenderer smr)
+                {
+                    // Для скиннованных мешей — копия проще не делается, пропускаем
+                    // (в прототипе интерактивные объекты — примитивы, меш-рендереры)
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_clone != null) Object.Destroy(_clone);
+            if (_outlineMat != null) Object.Destroy(_outlineMat);
+            _clone = null;
+            _outlineMat = null;
+        }
+    }
+}
+Если обводка через _CullMode не работает в конкретной версии HDRP: агент должен попробовать альтернативу — создать материал с HDRP/Unlit, полностью непрозрачный, рендерить дубликат меша БЕЗ cull-mode trick (то есть копию целиком). В результате получится сплошной силуэт — тоже работает как «подсветка предмета».
+
+Примечание: обводка не должна быть видна через стены (не использовать ZTest Always). Это намеренно: игрок видит обводку только на видимых предметах в поле зрения.
+
+Часть 4 — Сборка HUD (программная)
+📁 UI/HudBuilder.cs
+csharp
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro;
+
+namespace Lake.UI
+{
+    /// <summary>
+    /// Программно создаёт Canvas + все панели.
+    /// Вызывается из HorrorSceneBuilder или вручную через ContextMenu.
+    /// </summary>
+    public class HudBuilder : MonoBehaviour
+    {
+        [ContextMenu("Build HUD")]
+        public void Build()
+        {
+            // Проверка: не создан ли уже
+            var existing = GameObject.Find("Generated_HUD");
+            if (existing != null) DestroyImmediate(existing);
+
+            var canvasGo = new GameObject("Generated_HUD", typeof(Canvas), typeof(CanvasScaler), typeof(GraphicRaycaster), typeof(HudController));
+            var canvas = canvasGo.GetComponent<Canvas>();
+            canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+            canvas.sortingOrder = 100;
+
+            var scaler = canvasGo.GetComponent<CanvasScaler>();
+            scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
+            scaler.referenceResolution = new Vector2(1920, 1080);
+            scaler.matchWidthOrHeight = 0.5f;
+
+            var root = canvasGo.transform;
+
+            // Crosshair
+            var crosshair = CreateCrosshair(root);
+            // Interaction prompt
+            var prompt = CreatePrompt(root);
+            // Ammo
+            var ammo = CreateAmmo(root);
+            // Weapon slots
+            var slots = CreateSlots(root);
+            // Flashlight
+            var fl = CreateFlashlight(root);
+            // Health
+            var hp = CreateHealth(root);
+            // Bodycam overlay
+            var overlay = CreateOverlay(root);
+            // Key hints
+            var hints = CreateHints(root);
+            // Death screen
+            var death = CreateDeath(root);
+
+            // OutlineManager на отдельном объекте
+            var outlineGo = new GameObject("OutlineManager");
+            var outline = outlineGo.AddComponent<Outline.OutlineManager>();
+
+            // Назначить ссылки HudController
+            var hud = canvasGo.GetComponent<HudController>();
+            var so = new UnityEditor.SerializedObject(hud);
+            so.FindProperty("crosshair").objectReferenceValue = crosshair;
+            so.FindProperty("prompt").objectReferenceValue = prompt;
+            so.FindProperty("ammo").objectReferenceValue = ammo;
+            so.FindProperty("slots").objectReferenceValue = slots;
+            so.FindProperty("flashlight").objectReferenceValue = fl;
+            so.FindProperty("health").objectReferenceValue = hp;
+            so.FindProperty("overlay").objectReferenceValue = overlay;
+            so.FindProperty("keyHints").objectReferenceValue = hints;
+            so.FindProperty("deathScreen").objectReferenceValue = death;
+            so.FindProperty("outlineManager").objectReferenceValue = outline;
+            so.ApplyModifiedProperties();
+        }
+
+        // --- Builder helpers ---
+
+        static TMP_Text MakeText(Transform parent, string name, string text, int size,
+                                  TextAlignmentOptions align, Color color)
+        {
+            var go = new GameObject(name, typeof(RectTransform));
+            go.transform.SetParent(parent, false);
+            var t = go.AddComponent<TextMeshProUGUI>();
+            t.text = text;
+            t.fontSize = size;
+            t.color = color;
+            t.alignment = align;
+            t.fontStyle = FontStyles.Bold;
+            t.enableWordWrapping = false;
+            t.outlineWidth = 0.15f;
+            t.outlineColor = new Color32(0, 0, 0, 200);
+            return t;
+        }
+
+        static Image MakeImage(Transform parent, string name, Vector2 size, Color color, Vector2 anchor)
+        {
+            var go = new GameObject(name, typeof(RectTransform));
+            go.transform.SetParent(parent, false);
+            var rt = go.GetComponent<RectTransform>();
+            rt.sizeDelta = size;
+            rt.anchorMin = rt.anchorMax = anchor;
+            var img = go.AddComponent<Image>();
+            img.color = color;
+            return img;
+        }
+
+        CrosshairUI CreateCrosshair(Transform parent)
+        {
+            var root = new GameObject("Crosshair", typeof(RectTransform));
+            root.transform.SetParent(parent, false);
+            var rt = root.GetComponent<RectTransform>();
+            rt.anchorMin = rt.anchorMax = new Vector2(0.5f, 0.5f);
+            rt.sizeDelta = Vector2.zero;
+
+            var c = root.AddComponent<CrosshairUI>();
+
+            Color crossColor = new Color(1f, 1f, 1f, 0.7f);
+            Image MakeLine(string n, Vector2 size, Vector2 anchor)
+            {
+                var img = MakeImage(root.transform, n, size, crossColor, anchor);
+                img.rectTransform.pivot = new Vector2(0.5f, 0.5f);
+                return img;
+            }
+            var top = MakeLine("Top", new Vector2(1, 8), new Vector2(0.5f, 0.5f));
+            var bottom = MakeLine("Bottom", new Vector2(1, 8), new Vector2(0.5f, 0.5f));
+            var left = MakeLine("Left", new Vector2(8, 1), new Vector2(0.5f, 0.5f));
+            var right = MakeLine("Right", new Vector2(8, 1), new Vector2(0.5f, 0.5f));
+            var dot = MakeLine("Dot", new Vector2(2, 2), new Vector2(0.5f, 0.5f));
+
+            var so = new UnityEditor.SerializedObject(c);
+            so.FindProperty("top").objectReferenceValue = top.rectTransform;
+            so.FindProperty("bottom").objectReferenceValue = bottom.rectTransform;
+            so.FindProperty("left").objectReferenceValue = left.rectTransform;
+            so.FindProperty("right").objectReferenceValue = right.rectTransform;
+            so.FindProperty("dot").objectReferenceValue = dot;
+            so.ApplyModifiedProperties();
+            return c;
+        }
+
+        InteractionPromptUI CreatePrompt(Transform parent)
+        {
+            var go = new GameObject("InteractionPrompt", typeof(RectTransform), typeof(CanvasGroup));
+            go.transform.SetParent(parent, false);
+            var rt = go.GetComponent<RectTransform>();
+            rt.anchorMin = new Vector2(0.5f, 0);
+            rt.anchorMax = new Vector2(0.5f, 0);
+            rt.pivot = new Vector2(0.5f, 0);
+            rt.anchoredPosition = new Vector2(0, 120);
+            rt.sizeDelta = new Vector2(600, 40);
+
+            var t = MakeText(go.transform, "Label", "", 22, TextAlignmentOptions.Center, Color.white);
+            t.rectTransform.anchorMin = Vector2.zero;
+            t.rectTransform.anchorMax = Vector2.one;
+            t.rectTransform.sizeDelta = Vector2.zero;
+
+            var c = go.AddComponent<InteractionPromptUI>();
+            var so = new UnityEditor.SerializedObject(c);
+            so.FindProperty("group").objectReferenceValue = go.GetComponent<CanvasGroup>();
+            so.FindProperty("label").objectReferenceValue = t;
+            so.ApplyModifiedProperties();
+            return c;
+        }
+
+        AmmoPanelUI CreateAmmo(Transform parent)
+        {
+            var go = new GameObject("AmmoPanel", typeof(RectTransform));
+            go.transform.SetParent(parent, false);
+            var rt = go.GetComponent<RectTransform>();
+            rt.anchorMin = rt.anchorMax = new Vector2(1, 0);
+            rt.pivot = new Vector2(1, 0);
+            rt.anchoredPosition = new Vector2(-40, 40);
+            rt.sizeDelta = new Vector2(300, 120);
+
+            var name = MakeText(go.transform, "WeaponName", "", 14, TextAlignmentOptions.Right, new Color(1, 1, 1, 0.7f));
+            name.rectTransform.anchorMin = new Vector2(1, 1);
+            name.rectTransform.anchorMax = new Vector2(1, 1);
+            name.rectTransform.pivot = new Vector2(1, 1);
+            name.rectTransform.anchoredPosition = Vector2.zero;
+            name.rectTransform.sizeDelta = new Vector2(300, 20);
+
+            var cur = MakeText(go.transform, "Current", "00", 56, TextAlignmentOptions.Right, Color.white);
+            cur.rectTransform.anchorMin = new Vector2(1, 0);
+            cur.rectTransform.anchorMax = new Vector2(1, 0);
+            cur.rectTransform.pivot = new Vector2(1, 0);
+            cur.rectTransform.anchoredPosition = new Vector2(0, 0);
+            cur.rectTransform.sizeDelta = new Vector2(200, 80);
+
+            var res = MakeText(go.transform, "Reserve", "000", 24, TextAlignmentOptions.Right, new Color(1, 1, 1, 0.6f));
+            res.rectTransform.anchorMin = new Vector2(1, 0);
+            res.rectTransform.anchorMax = new Vector2(1, 0);
+            res.rectTransform.pivot = new Vector2(1, 0);
+            res.rectTransform.anchoredPosition = new Vector2(-2, 30);
+            res.rectTransform.sizeDelta = new Vector2(80, 30);
+
+            var c = go.AddComponent<AmmoPanelUI>();
+            var so = new UnityEditor.SerializedObject(c);
+            so.FindProperty("current").objectReferenceValue = cur;
+            so.FindProperty("reserve").objectReferenceValue = res;
+            so.FindProperty("weaponName").objectReferenceValue = name;
+            so.ApplyModifiedProperties();
+            return c;
+        }
+
+        WeaponSlotsUI CreateSlots(Transform parent)
+        {
+            var go = new GameObject("WeaponSlots", typeof(RectTransform));
+            go.transform.SetParent(parent, false);
+            var rt = go.GetComponent<RectTransform>();
+            rt.anchorMin = rt.anchorMax = new Vector2(1, 0);
+            rt.pivot = new Vector2(1, 0);
+            rt.anchoredPosition = new Vector2(-40, 170);
+            rt.sizeDelta = new Vector2(140, 60);
+
+            var c = go.AddComponent<WeaponSlotsUI>();
+            var so = new UnityEditor.SerializedObject(c);
+            var slots = so.FindProperty("slots");
+            slots.arraySize = 2;
+            string[] names = { "RIFLE", "SHOTGUN" };
+            for (int i = 0; i < 2; i++)
+            {
+                var slotGo = new GameObject($"Slot{i}", typeof(RectTransform), typeof(Image));
+                slotGo.transform.SetParent(go.transform, false);
+                var srt = slotGo.GetComponent<RectTransform>();
+                srt.anchorMin = srt.anchorMax = new Vector2(1, 0);
+                srt.pivot = new Vector2(1, 0);
+                srt.anchoredPosition = new Vector2(-i * 68, 0);
+                srt.sizeDelta = new Vector2(60, 60);
+                var img = slotGo.GetComponent<Image>();
+                img.color = new Color(1, 1, 1, 0.1f);
+
+                var key = MakeText(slotGo.transform, "Key", $"[{i + 1}]", 12, TextAlignmentOptions.Center, new Color(1f, 0.85f, 0.3f));
+                key.rectTransform.anchorMin = new Vector2(0.5f, 1);
+                key.rectTransform.anchorMax = new Vector2(0.5f, 1);
+                key.rectTransform.pivot = new Vector2(0.5f, 1);
+                key.rectTransform.anchoredPosition = new Vector2(0, -2);
+                key.rectTransform.sizeDelta = new Vector2(60, 14);
+
+                var lbl = MakeText(slotGo.transform, "Label", names[i], 10, TextAlignmentOptions.Center, Color.white);
+                lbl.rectTransform.anchorMin = new Vector2(0.5f, 0);
+                lbl.rectTransform.anchorMax = new Vector2(0.5f, 0);
+                lbl.rectTransform.pivot = new Vector2(0.5f, 0);
+                lbl.rectTransform.anchoredPosition = new Vector2(0, 4);
+                lbl.rectTransform.sizeDelta = new Vector2(60, 14);
+
+                var el = slots.GetArrayElementAtIndex(i);
+                el.FindPropertyRelative("background").objectReferenceValue = img;
+                el.FindPropertyRelative("label").objectReferenceValue = lbl;
+                el.FindPropertyRelative("keyLabel").objectReferenceValue = key;
+            }
+            so.ApplyModifiedProperties();
+            return c;
+        }
+
+        FlashlightUI CreateFlashlight(Transform parent)
+        {
+            var go = new GameObject("FlashlightUI", typeof(RectTransform));
+            go.transform.SetParent(parent, false);
+            var rt = go.GetComponent<RectTransform>();
+            rt.anchorMin = rt.anchorMax = new Vector2(0, 0);
+            rt.pivot = new Vector2(0, 0);
+            rt.anchoredPosition = new Vector2(40, 40);
+            rt.sizeDelta = new Vector2(240, 40);
+
+            var icon = MakeImage(go.transform, "Icon", new Vector2(20, 20), new Color(1, 1, 1, 0.3f), new Vector2(0, 0.5f));
+            icon.rectTransform.anchoredPosition = new Vector2(10, 0);
+
+            var status = MakeText(go.transform, "Status", "FLASHLIGHT OFF", 14, TextAlignmentOptions.Left, new Color(1, 1, 1, 0.3f));
+            status.rectTransform.anchorMin = new Vector2(0, 0.5f);
+            status.rectTransform.anchorMax = new Vector2(0, 0.5f);
+            status.rectTransform.pivot = new Vector2(0, 0.5f);
+            status.rectTransform.anchoredPosition = new Vector2(40, 0);
+            status.rectTransform.sizeDelta = new Vector2(200, 20);
+
+            var bat = MakeImage(go.transform, "Battery", new Vector2(100, 4), new Color(1f, 0.9f, 0.4f), new Vector2(0, 0.5f));
+            bat.rectTransform.anchoredPosition = new Vector2(40, -14);
+            bat.type = Image.Type.Filled;
+            bat.fillMethod = Image.FillMethod.Horizontal;
+
+            var c = go.AddComponent<FlashlightUI>();
+            var so = new UnityEditor.SerializedObject(c);
+            so.FindProperty("icon").objectReferenceValue = icon;
+            so.FindProperty("status").objectReferenceValue = status;
+            so.FindProperty("batteryFill").objectReferenceValue = bat;
+            so.ApplyModifiedProperties();
+            return c;
+        }
+
+        HealthBarUI CreateHealth(Transform parent)
+        {
+            var go = new GameObject("HealthBar", typeof(RectTransform));
+            go.transform.SetParent(parent, false);
+            var rt = go.GetComponent<RectTransform>();
+            rt.anchorMin = rt.anchorMax = new Vector2(0, 0);
+            rt.pivot = new Vector2(0, 0);
+            rt.anchoredPosition = new Vector2(40, 90);
+            rt.sizeDelta = new Vector2(220, 14);
+
+            var bg = go.AddComponent<Image>();
+            bg.color = new Color(0, 0, 0, 0.5f);
+
+            var fillGo = new GameObject("Fill", typeof(RectTransform), typeof(Image));
+            fillGo.transform.SetParent(go.transform, false);
+            var frt = fillGo.GetComponent<RectTransform>();
+            frt.anchorMin = Vector2.zero; frt.anchorMax = Vector2.one;
+            frt.sizeDelta = Vector2.zero;
+            var fill = fillGo.GetComponent<Image>();
+            fill.type = Image.Type.Filled;
+            fill.fillMethod = Image.FillMethod.Horizontal;
+            fill.color = new Color(0.2f, 0.9f, 0.3f);
+
+            var label = MakeText(go.transform, "Value", "100 / 100", 10, TextAlignmentOptions.Center, Color.white);
+            label.rectTransform.anchorMin = Vector2.zero; label.rectTransform.anchorMax = Vector2.one;
+            label.rectTransform.sizeDelta = Vector2.zero;
+
+            var c = go.AddComponent<HealthBarUI>();
+            var so = new UnityEditor.SerializedObject(c);
+            so.FindProperty("fill").objectReferenceValue = fill;
+            so.FindProperty("valueLabel").objectReferenceValue = label;
+            so.ApplyModifiedProperties();
+            return c;
+        }
+
+        BodyCamOverlayUI CreateOverlay(Transform parent)
+        {
+            var go = new GameObject("BodyCamOverlay", typeof(RectTransform), typeof(CanvasGroup));
+            go.transform.SetParent(parent, false);
+            var rt = go.GetComponent<RectTransform>();
+            rt.anchorMin = Vector2.zero; rt.anchorMax = Vector2.one;
+            rt.sizeDelta = Vector2.zero;
+            var cg = go.GetComponent<CanvasGroup>();
+            cg.alpha = 1f;
+
+            // REC (top-left)
+            var rec = MakeText(go.transform, "REC", "● REC", 22, TextAlignmentOptions.Left, Color.red);
+            rec.rectTransform.anchorMin = rec.rectTransform.anchorMax = new Vector2(0, 1);
+            rec.rectTransform.pivot = new Vector2(0, 1);
+            rec.rectTransform.anchoredPosition = new Vector2(40, -40);
+            rec.rectTransform.sizeDelta = new Vector2(200, 30);
+
+            var tc = MakeText(go.transform, "Timecode", "00:00:00:00", 16, TextAlignmentOptions.Left, Color.white);
+            tc.rectTransform.anchorMin = tc.rectTransform.anchorMax = new Vector2(0, 1);
+            tc.rectTransform.pivot = new Vector2(0, 1);
+            tc.rectTransform.anchoredPosition = new Vector2(40, -70);
+            tc.rectTransform.sizeDelta = new Vector2(300, 24);
+
+            var camId = MakeText(go.transform, "CamId", "CAM-01", 14, TextAlignmentOptions.Right, new Color(1, 1, 1, 0.8f));
+            camId.rectTransform.anchorMin = camId.rectTransform.anchorMax = new Vector2(1, 1);
+            camId.rectTransform.pivot = new Vector2(1, 1);
+            camId.rectTransform.anchoredPosition = new Vector2(-40, -40);
+            camId.rectTransform.sizeDelta = new Vector2(300, 20);
+
+            var date = MakeText(go.transform, "Date", "", 12, TextAlignmentOptions.Right, new Color(1, 1, 1, 0.6f));
+            date.rectTransform.anchorMin = date.rectTransform.anchorMax = new Vector2(1, 1);
+            date.rectTransform.pivot = new Vector2(1, 1);
+            date.rectTransform.anchoredPosition = new Vector2(-40, -64);
+            date.rectTransform.sizeDelta = new Vector2(300, 18);
+
+            var bat = MakeText(go.transform, "Battery", "100%", 12, TextAlignmentOptions.Right, new Color(1, 1, 1, 0.6f));
+            bat.rectTransform.anchorMin = bat.rectTransform.anchorMax = new Vector2(1, 1);
+            bat.rectTransform.pivot = new Vector2(1, 1);
+            bat.rectTransform.anchoredPosition = new Vector2(-40, -86);
+            bat.rectTransform.sizeDelta = new Vector2(300, 18);
+
+            var c = go.AddComponent<BodyCamOverlayUI>();
+            var so = new UnityEditor.SerializedObject(c);
+            so.FindProperty("group").objectReferenceValue = cg;
+            so.FindProperty("recLabel").objectReferenceValue = rec;
+            so.FindProperty("timecodeLabel").objectReferenceValue = tc;
+            so.FindProperty("dateLabel").objectReferenceValue = date;
+            so.FindProperty("camIdLabel").objectReferenceValue = camId;
+            so.FindProperty("batteryLabel").objectReferenceValue = bat;
+            so.ApplyModifiedProperties();
+            return c;
+        }
+
+        KeyHintsUI CreateHints(Transform parent)
+        {
+            var go = new GameObject("KeyHints", typeof(RectTransform), typeof(CanvasGroup));
+            go.transform.SetParent(parent, false);
+            var rt = go.GetComponent<RectTransform>();
+            rt.anchorMin = rt.anchorMax = new Vector2(0.5f, 1);
+            rt.pivot = new Vector2(0.5f, 1);
+            rt.anchoredPosition = new Vector2(0, -40);
+            rt.sizeDelta = new Vector2(900, 100);
+
+            var bg = go.AddComponent<Image>();
+            bg.color = new Color(0, 0, 0, 0.4f);
+
+            var label = MakeText(go.transform, "Hints", "", 12, TextAlignmentOptions.Center, new Color(1, 1, 1, 0.9f));
+            label.rectTransform.anchorMin = Vector2.zero; label.rectTransform.anchorMax = Vector2.one;
+            label.rectTransform.sizeDelta = new Vector2(-20, -10);
+
+            var c = go.AddComponent<KeyHintsUI>();
+            var so = new UnityEditor.SerializedObject(c);
+            so.FindProperty("group").objectReferenceValue = go.GetComponent<CanvasGroup>();
+            so.FindProperty("label").objectReferenceValue = label;
+            so.ApplyModifiedProperties();
+            return c;
+        }
+
+        DeathScreenUI CreateDeath(Transform parent)
+        {
+            var go = new GameObject("DeathScreen", typeof(RectTransform), typeof(CanvasGroup), typeof(Image));
+            go.transform.SetParent(parent, false);
+            var rt = go.GetComponent<RectTransform>();
+            rt.anchorMin = Vector2.zero; rt.anchorMax = Vector2.one;
+            rt.sizeDelta = Vector2.zero;
+            go.GetComponent<Image>().color = new Color(0, 0, 0, 0.9f);
+            go.SetActive(false);
+
+            var title = MakeText(go.transform, "Title", "SIGNAL LOST", 72, TextAlignmentOptions.Center, new Color(0.9f, 0.1f, 0.1f));
+            title.rectTransform.anchorMin = title.rectTransform.anchorMax = new Vector2(0.5f, 0.5f);
+            title.rectTransform.anchoredPosition = new Vector2(0, 60);
+            title.rectTransform.sizeDelta = new Vector2(900, 100);
+
+            var countdown = MakeText(go.transform, "Countdown", "", 22, TextAlignmentOptions.Center, Color.white);
+            countdown.rectTransform.anchorMin = countdown.rectTransform.anchorMax = new Vector2(0.5f, 0.5f);
+            countdown.rectTransform.anchoredPosition = new Vector2(0, -40);
+            countdown.rectTransform.sizeDelta = new Vector2(900, 40);
+
+            var c = go.AddComponent<DeathScreenUI>();
+            var so = new UnityEditor.SerializedObject(c);
+            so.FindProperty("group").objectReferenceValue = go.GetComponent<CanvasGroup>();
+            so.FindProperty("title").objectReferenceValue = title;
+            so.FindProperty("countdown").objectReferenceValue = countdown;
+            so.ApplyModifiedProperties();
+            return c;
+        }
+    }
+}
+Часть 5 — Интеграция в HorrorSceneBuilder
+Модифицировать HorrorSceneBuilder.CreatePlayer():
+
+csharp
+// После Instantiate player'а:
+var spawner = root.GetComponent<PlayerSpawner>();
+// Подписка на OnPlayerSpawned — через HudController:
+// Но проще — HudController находит игрока динамически.
+
+// В HorrorSceneBuilder:
+void CreateHud()
+{
+    var hudGo = new GameObject("HudBuilder");
+    hudGo.AddComponent<HudBuilder>().Build();
+    // Найти игрока и передать в HudController
+}
+HudController должен иметь метод Bind() и HudBuilder.BindPlayerToHud() — агент должен реализовать автоматический поиск PlayerInteractor, WeaponController, Flashlight, HealthComponent через FindFirstObjectByType. Например, добавить в HudController:
+
+csharp
+void Start()
+{
+    StartCoroutine(BindDelayed());
+}
+
+IEnumerator BindDelayed()
+{
+    yield return new WaitUntil(() => FindFirstObjectByType<PlayerInteractor>() != null
+                                  && FindFirstObjectByType<WeaponController>() != null);
+    var pi = FindFirstObjectByType<PlayerInteractor>();
+    var wc = FindFirstObjectByType<WeaponController>();
+    var fl = FindFirstObjectByType<Flashlight.Flashlight>();
+    var hp = FindFirstObjectByType<HealthComponent>();
+    var bc = FindFirstObjectByType<BodyCamController>();
+    var sp = FindFirstObjectByType<PlayerSpawner>();
+    Bind(pi, wc, fl, hp, bc, sp);
+}
+Часть 6 — Обновить префабы пикапов
+На все префабы/объекты с WeaponPickup добавить компонент Highlightable с HighlightColor = (1f, 0.85f, 0.2f) (золотой).
+
+В HorrorSceneBuilder.SpawnPickup():
+
+csharp
+go.AddComponent<Outline.Highlightable>().HighlightColor = new Color(1f, 0.85f, 0.2f);
+✅ Верификационный чек-лист
+После запуска Play Mode:
+
+HUD база:
+
+□ Crosshair в центре экрана, 4 линии + точка
+□ Crosshair раздвигается при стрельбе (spread растёт) и сжимается после
+□ Патроны внизу справа: 30 / 120, имя оружия RIFLE
+□ Патроны становятся оранжевыми при < 25%, красными при 0
+□ Слоты оружия: [1] RIFLE [2] SHOTGUN, активный подсвечен золотым
+□ Фонарик внизу слева: FLASHLIGHT OFF → F → FLASHLIGHT ON жёлтым
+□ Полоса здоровья над фонариком
+□ Key hints панель вверху, TAB скрывает/показывает
+□ Bodycam overlay: ● REC мигает, таймкод 00:00:15:23 растёт, CAM-01 // PATROL, батарея
+Interaction + Outline:
+
+□ Подхожу к ружью → crosshair остаётся, внизу [E] Pick up Rifle
+□ Ружьё подсвечивается золотой обводкой
+□ Отхожу → обводка исчезает, prompt исчезает (fade out)
+□ Навожусь на стену → нет обводки, prompt пропадает
+□ Навожусь на мишень (если добавить Highlightable) → обводка
+Bodycam toggle:
+
+□ B → bodycam-эффекты toggle
+□ B → при выключении оверлей (REC, таймкод) тоже fade out
+□ B снова → всё возвращается
+Death:
+
+□ Наношу себе урон (или через дебаг-кнопку) → HP 0 → смерть
+□ Экран: чёрный фон, SIGNAL LOST красным, countdown RECONNECTING... 2
+□ Через 2 сек — респавн, экран исчезает, HUD восстановлен
+Outline fallback:
+
+□ Если обводка выглядит как сплошной силуэт — это приемлемо (HDRP fallback)
+□ Если обводки нет совсем — неприемлемо, вернуть агенту на доработку
+Интеграция:
+
+□ При смерти outline текущей цели скрыт
+□ При смене оружия ammo панель обновляется
+□ При reload ammo обновляется в реальном времени
+🚨 Критичные моменты для агента
+Не переписывать существующие скрипты — только добавлять события/геттеры.
+
+Обводка не видна через стены (нет ZTest Always) — иначе визуальный шум.
+
+Одновременно подсвечен только один объект — OutlineManager гарантирует.
+
+HUD строится программно через HudBuilder.Build() — не нужно создавать prefab, всё в коде.
+
+HudController.Start() ждёт появления игрока через WaitUntil — не пытаться биндиться в Awake.
+
+TMP: если в проекте нет TextMeshPro — добавить пакет com.unity.textmeshpro или использовать legacy Text.
+
+InputProvider.OnTabPressed — новый event, нужно добавить в InputProvider.cs.
+
+Outline fallback: если _CullMode=Front не работает — переключиться на непрозрачный дубликат меша (просто скопировать цвет, без cull trick). Агент должен проверить визуально и выбрать рабочий вариант.
+
+🎯 Финальный результат
+Прототип получает:
+
+Полный HUD в стиле полицейской бодикамеры
+
+Динамический прицел с обратной связью на spread
+
+Подсветку интерактивных предметов (обводка)
+
+Подсказку [E] Pick up X
+
+Индикаторы оружия, патронов, фонарика, здоровья
+
+Иммерсивный оверлей (REC, таймкод, CAM-ID)
+
+Панель клавиш с toggle (Tab)
+
+Экран смерти с респавном
+
+Стилистика — утилитарная, «сырая», зелёно-бело-красная, как реальный bodycam. Без глянца, без анимаций «наезда», без прогресс-баров с блеском.

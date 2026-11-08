@@ -1,0 +1,1 @@
+{"query": "objects | where name == 'Main Camera' | get components | where $type == 'PlayerCamera' | set weaponPivot = ref('WeaponPivotController#-39436')"}

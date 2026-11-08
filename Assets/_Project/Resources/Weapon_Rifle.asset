@@ -1,0 +1,45 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 664e37ebd2cf1154fa24eb2aa1f21cbf, type: 3}
+  m_Name: Weapon_Rifle
+  m_EditorClassIdentifier: Assembly-CSharp::Lake.Weapons.WeaponDataSO
+  type: 0
+  displayName: Assault Rifle
+  isAutomatic: 1
+  fireRate: 0.12
+  pelletsPerShot: 1
+  damagePerPellet: 25
+  range: 100
+  hitMask:
+    serializedVersion: 2
+    m_Bits: 4294967295
+  baseSpread: 0.3
+  spreadPerShot: 0.25
+  maxSpread: 3
+  spreadRecovery: 4
+  adsSpreadMultiplier: 0
+  falloffStart: 30
+  falloffEnd: 80
+  minDamageMultiplier: 0.4
+  recoilVertical: 1.2
+  recoilHorizontal: 0.3
+  visualKickback: 0.08
+  magazineSize: 30
+  reserveAmmoMax: 120
+  reloadTime: 2.5
+  shellByShellReload: 0
+  shellReloadTime: 0.5
+  hipPosition: {x: 0.22, y: -0.22, z: 0.4}
+  adsPosition: {x: 0, y: -0.14, z: 0.3}
+  hipFov: 65
+  adsFov: 48
+  adsSensitivityMultiplier: 0.55

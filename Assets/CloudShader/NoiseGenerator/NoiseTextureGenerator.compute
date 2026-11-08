@@ -1,0 +1,286 @@
+﻿#pragma kernel ShapeTextureGen
+#pragma kernel DetailTextureGen
+#pragma kernel WeatherMapGen
+
+#include "NoiseHelper.compute"
+
+// used for dispatching the shaders
+static const int numThreads = 8;
+static const int numGroupsShape = 16;
+static const int numGroupsDetail = 4;
+
+// parameters of the shape noise
+int shapeCellSizeGreen;
+int shapeCellSizeBlue;
+int shapeCellSizeAlpha;
+
+int shapeGreenOctaves;
+int shapeBlueOctaves;
+int shapeAlphaOctaves;
+
+// parameters of the detail noise
+
+int detailCellSizeGreen;
+int detailCellSizeBlue;
+int detailCellSizeRed;
+
+int detailGreenOctaves;
+int detailBlueOctaves;
+int detailRedOctaves;
+
+RWTexture3D<float4> ResultShape; // result texture used both for shape noise
+RWTexture3D<float4> ResultDetail; // result texture used both for detail noise
+RWTexture2D<float4> ResultWeatherMap; // result texture used for weather map
+RWStructuredBuffer<float3> FeaturePoints; // random points given from the noise generator script
+
+// perlin settings of the shape noise
+int perlinOctaves; // 8 by default
+float perlinFrequency; // 1 by default
+float perlinPersistence; // 0.6 by default
+int perlinLacunarity; // 2 by default
+int perlinTextureResolution;
+
+// weather map settings
+int coveragePerlinOctaves; // 8 by default
+float coveragePerlinFrequency; // 1 by default
+float coveragePerlinPersistence; // 0.6 by default
+int coveragePerlinLacunarity; // 2 by default
+int coveragePerlinTextureResolution;
+bool coverageOption;
+float coverageConstant;
+float cloudHeight;
+float cloudType;
+
+// returns the perlin noise at 3D point [id.x, id.y, id.z]
+float getPerlinNoise3D (float x, float y, float z, int currRes)
+{
+    // initialize perm array to avoid buffer overflow (by repeating the permutation array)
+    resizePermArray();
+
+    // define parameters of the Perlin function
+	float result = 0;
+	float amplitude = 1;
+	float max = 0;
+	for (int i = 0; i < perlinOctaves; i++) //compute perlin noise for each octave
+	{
+		result += getPerlinValue3D(x * perlinFrequency, y * perlinFrequency, z * perlinFrequency, currRes) * amplitude;
+		max += amplitude;
+		amplitude *= perlinPersistence;
+		perlinFrequency *= perlinLacunarity;
+	}
+	float res = result / max;
+    return res;
+}
+
+// returns the perlin noise at 2D point [id.x, id.y]
+float getPerlinNoise2D (float x, float y, int currRes)
+{
+    // initialize perm array to avoid buffer overflow (by repeating the permutation array)
+    resizePermArray();
+
+    // define parameters of the Perlin function
+	float result = 0;
+	float amplitude = 1;
+	float max = 0;
+	for (int i = 0; i < coveragePerlinOctaves; i++) //compute perlin noise for each octave
+	{
+		result += getPerlinValue2D(x * coveragePerlinFrequency, y * coveragePerlinFrequency, currRes) * amplitude;
+		max += amplitude;
+		amplitude *= coveragePerlinPersistence;
+		coveragePerlinFrequency *= coveragePerlinLacunarity;
+	}
+    return result/max;
+}
+
+// get the worley noise value
+float getWorleyValue(uint3 id, uint cellSize, uint textureResolution)
+{
+    uint noOfCells = textureResolution / cellSize;
+
+    // save the position of the current point
+    float3 myPos = float3(id.x, id.y, id.z);
+
+    // get the cell our point is in (therefore myCell will have values from 0 to noOfCells)
+    float3 myCell = float3(id.x/ cellSize, id.y/ cellSize, id.z/ cellSize);
+
+    // the distance to the feature point, starting with a max distance
+    float bestDistance = textureResolution * textureResolution * textureResolution;
+
+    // iterate over all the neighboring cells to find the nearest feature point
+    for (int i = -1; i < 2; i++) // offset on the x coord
+    {
+        // boolean values are used to check whether some feature points might be in the next tile
+        // used so the tiling is smooth
+        bool xOverCell = false;
+        bool xUnderCell = false;
+        if (myCell.x == (noOfCells - 1) && i == 1)
+            xOverCell = true;
+        if (myCell.x == 0 && i == -1)
+            xUnderCell = true;
+
+        for (int j = -1; j < 2; j++) // offset on the y coord
+        {
+            // tiling for ycoord
+            bool yOverCell = false;
+            bool yUnderCell = false;
+            if (myCell.y == (noOfCells - 1) && j == 1)
+                yOverCell = true;
+            if (myCell.y == 0 && j == -1)
+                yUnderCell = true;
+
+            for (int k = -1; k < 2; k++) // offset on the z coord
+            {
+                // tiling for z coord
+                bool zOverCell = false;
+                bool zUnderCell = false;
+                if (myCell.z == (noOfCells - 1) && k == 1)
+                    zOverCell = true;
+                if (myCell.z == 0 && k == -1)
+                    zUnderCell = true;
+
+                // get the neighbor cell
+                float3 neightbourCell = float3(myCell.x + i, myCell.y + j, myCell.z + k);
+
+                // to avoid overflow
+                if (xOverCell)
+                    neightbourCell.x = 0;
+                else if (xUnderCell)
+                    neightbourCell.x = (noOfCells - 1);
+                if (yOverCell)
+                    neightbourCell.y = 0;
+                else if (yUnderCell)
+                    neightbourCell.y = (noOfCells - 1);
+                if (zOverCell)
+                    neightbourCell.z = 0;
+                else if (zUnderCell)
+                    neightbourCell.z = (noOfCells - 1);
+
+                // get the offset in the cell and the actual position
+                float posInBuffer = neightbourCell.x * noOfCells * noOfCells + neightbourCell.y * noOfCells + neightbourCell.z;
+                float3 cellOffset = FeaturePoints[posInBuffer] * cellSize;
+                float3 currPos = cellOffset  + neightbourCell * cellSize;
+
+                // get the difference between myPos and feature point position for all axis'
+                int diffX = 0;
+                int diffY = 0;
+                int diffZ = 0;
+
+                if (xOverCell)
+                    diffX = cellSize * noOfCells - 1 - myPos.x + currPos.x;
+                else if (xUnderCell)
+                    diffX = cellSize * noOfCells  - 1 - currPos.x + myPos.x;
+                else
+                    diffX = currPos.x - myPos.x;
+                
+                if (yOverCell)
+                    diffY = cellSize * noOfCells  - 1 - myPos.y + currPos.y;
+                else if (yUnderCell)
+                    diffY = cellSize * noOfCells  - 1 - currPos.y + myPos.y;
+                else
+                    diffY = currPos.y - myPos.y;
+                
+                if (zOverCell)
+                    diffZ = cellSize * noOfCells  - 1 - myPos.z + currPos.z;
+                else if (zUnderCell)
+                    diffZ = cellSize * noOfCells  - 1 - currPos.z + myPos.z;
+                else
+                    diffZ = currPos.z - myPos.z;
+
+                // get the distance between our point and the feature point
+                float dist = sqrt(pow(diffX, 2) + pow(diffY, 2) + pow(diffZ, 2));
+
+                // if it's better, update the best distance
+                if (bestDistance > dist)
+                    bestDistance = dist;
+            }
+        }
+    }
+    // get the highest possible distance between a feature point and a point
+    float highestDistance = cellSize; // a parameter that I found to work the best
+    bestDistance = bestDistance / highestDistance;
+    return bestDistance;
+}
+
+// worley noise for multiple octaves
+float getWorleyNoise(uint3 id, uint cellSize, uint textureResolution, uint octaves)
+{
+    if (octaves == 1)
+        return getWorleyValue(uint3(id.x, id.y, id.z), cellSize, textureResolution);
+
+    // set worley noise settings
+	float result = 0;
+	float worleyFrequency = 1;
+    float worleyPersistence = 0.6;
+	float worleyAmplitude = worleyPersistence;
+    float worleyLacunarity = 2;
+	float max = 0;
+
+	for (uint i = 0; i < octaves; i++) //compute perlin noise for each octave
+	{
+		result += getWorleyValue(uint3(id.x * worleyFrequency, id.y * worleyFrequency, id.z * worleyFrequency), cellSize, textureResolution) * worleyAmplitude;
+        max += worleyAmplitude;
+		worleyAmplitude *= worleyPersistence;
+		worleyFrequency *= worleyLacunarity;
+	}
+
+	float res = result/max;
+    return res;
+}
+
+[numthreads(numThreads,numThreads,numThreads)]
+void ShapeTextureGen (uint3 id : SV_DispatchThreadID)
+{
+    int resolution = numThreads * numGroupsShape; //resolution of the shape texture
+    
+    float worleyChannelGreen = getWorleyNoise(id, shapeCellSizeGreen, resolution, shapeGreenOctaves);
+    float worleyChannelBlue = getWorleyNoise(id, shapeCellSizeBlue, resolution, shapeBlueOctaves);
+    float worleyChannelAlpha = getWorleyNoise(id, shapeCellSizeAlpha, resolution, shapeAlphaOctaves);
+    
+    // initialize perm array to avoid buffer overflow (by repeating the permutation array)
+    resizePermArray();
+
+    // get the actual float points we are going to calculate
+    float tex = (float) perlinTextureResolution;
+    float x = (float) id.x / tex;
+    float y = (float) id.y / tex;
+    float z = (float) id.z / tex;
+    float perlinChannelRed = getPerlinNoise3D(x, y, z, perlinTextureResolution);
+
+    // invert worley noise and return perlin noise in the red channel
+    ResultShape[id.xyz] = float4(1,1,1,1) - float4(1 - perlinChannelRed, worleyChannelGreen,worleyChannelBlue,  worleyChannelAlpha);
+}
+
+[numthreads(numThreads,numThreads,numThreads)]
+void DetailTextureGen (uint3 id : SV_DispatchThreadID)
+{
+    int resolution = numThreads * numGroupsDetail; // get the resolution of the detail texture
+    
+    float worleyChannelGreen = getWorleyNoise(id, detailCellSizeGreen, resolution, detailGreenOctaves);
+    float worleyChannelBlue = getWorleyNoise(id, detailCellSizeBlue, resolution, detailBlueOctaves);
+    float worleyChannelRed = getWorleyNoise(id, detailCellSizeRed, resolution, detailRedOctaves);
+
+    // invert the worley noise
+    ResultDetail[id.xyz] = float4(1,1,1,1) - float4(worleyChannelRed, worleyChannelGreen, worleyChannelBlue, 0);
+}
+
+[numthreads(numThreads,numThreads,1)]
+void WeatherMapGen (uint3 id : SV_DispatchThreadID)
+{
+    float redChannel = 0;
+    if (!coverageOption)
+        redChannel = coverageConstant; // constant coverage chosen by the user
+    else
+    {
+        // compute perlin from user-inserted perlin values
+        float tex = (float) coveragePerlinTextureResolution;
+        float x = (float) id.x / tex;
+        float y = (float) id.y / tex;
+        redChannel = getPerlinNoise2D(x,y,tex);
+    }
+
+    //compute the cloud height from 400nm to 1000nm as a value from 0 to 1
+    float greenChannel = (cloudHeight - 400) / 600;
+    // cloud type is already from 0 to 1
+    float blueChannel = cloudType;
+    ResultWeatherMap[id.xy] = float4(redChannel, greenChannel, blueChannel, 1);
+}

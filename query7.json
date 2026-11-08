@@ -1,0 +1,1 @@
+{"query": "objects | where name == 'WeaponPivot' | recurse children max-depth=4 | select name active $ref components.$type"}

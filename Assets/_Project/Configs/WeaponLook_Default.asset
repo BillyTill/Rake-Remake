@@ -1,0 +1,20 @@
+fileFormatVersion: 2
+guid: 2b3e8a4f5c6d7e8f9a0b1c2d3e4f5a6b
+WeaponLookConfig:
+  m_ObjectHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 1834b2545de02064aa31e00400c3386f, type: 3}
+  legacyMouseSensitivity: 1.44
+  pixelToCountFactor: 5.3
+  invertY: 0
+  maxYawPerFrame: 120
+  baseFov: 60
+  adsFovMultiplier: 2.5
+  minPitch: -85
+  maxPitch: 85
+  deadZoneAngle: 12
+  maxReticleOffset: 8
+  returnToCenter: 1
+  returnSpeed: 45
+  catchUpBand: 4
+  catchUpSpeed: 30
+  maxCatchUpSpeed: 180

@@ -1,0 +1,3 @@
+ADD-LOD v8.6 start
+SKIP prefab_Beech_mushroom_04C (no photo)
+done: added=107 of 108 failed=0

@@ -1,0 +1,1 @@
+{"query": "objects | where name == 'Player' | get components | where $type == 'PlayerWeapons' | set aimSource = unity.find('WeaponPivot'), weaponPivot = unity.find('WeaponPivot')"}
